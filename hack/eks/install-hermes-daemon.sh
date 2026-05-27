@@ -11,6 +11,7 @@ HERMES_DAEMON_ROOT="${HERMES_DAEMON_ROOT:-/var/lib/hermes-daemon}"
 HERMES_DAEMON_ADDRESS="${HERMES_DAEMON_ADDRESS:-/run/hermes-daemon/hermes-daemon.sock}"
 RESTART_CONTAINERD="${RESTART_CONTAINERD:-true}"
 CONTAINERD_CONFIG="${CONTAINERD_CONFIG:-/etc/containerd/config.toml}"
+KUBELET_ENV_FILE="${KUBELET_ENV_FILE:-/etc/eks/kubelet/environment}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "install-hermes-daemon.sh must run as root. In userData this is already root; manually use: curl ... | sudo -E bash" >&2
@@ -144,6 +145,10 @@ cat >"${HERMES_CONFIG_PATH}" <<EOF_CONFIG
   timeout_sec = 5
   platform = "${HERMES_PLATFORM}"
   fallback_to_registry = true
+
+[cri_keychain]
+  enable_keychain = true
+  image_service_path = "/run/containerd/containerd.sock"
 EOF_CONFIG
 
 cat >/etc/systemd/system/hermes-daemon.service <<EOF_SERVICE
@@ -261,6 +266,73 @@ enable_cri_snapshotter() {
     exit "${rc}"
   }
 
+  set_disable_snapshot_annotations_in_table() {
+    local table_path="$1"
+    local tmp_config="${CONTAINERD_CONFIG}.hermes"
+    local rc
+
+    awk -v table_path="${table_path}" '
+      function normalize(line) {
+        normalized = line
+        gsub(/["\047[:space:]]/, "", normalized)
+        return normalized
+      }
+      function is_section(line) {
+        return line ~ /^[[:space:]]*\[/
+      }
+      function is_target_section(line) {
+        return normalize(line) == "[plugins." table_path "]"
+      }
+      function write_option_if_missing() {
+        if (in_target && !option_written) {
+          print "  disable_snapshot_annotations = false"
+          option_written = 1
+        }
+      }
+      BEGIN {
+        in_target = 0
+        target_seen = 0
+        option_written = 0
+      }
+      is_section($0) {
+        write_option_if_missing()
+        in_target = is_target_section($0)
+        if (in_target) {
+          target_seen = 1
+          option_written = 0
+        }
+        print
+        next
+      }
+      in_target && $0 ~ /^[[:space:]]*disable_snapshot_annotations[[:space:]]*=/ {
+        print "  disable_snapshot_annotations = false"
+        option_written = 1
+        next
+      }
+      {
+        print
+      }
+      END {
+        write_option_if_missing()
+        if (!target_seen) {
+          exit 42
+        }
+      }
+    ' "${CONTAINERD_CONFIG}" >"${tmp_config}" || rc=$?
+
+    if [[ "${rc:-0}" -eq 0 ]]; then
+      mv "${tmp_config}" "${CONTAINERD_CONFIG}"
+      return 0
+    fi
+
+    rm -f "${tmp_config}"
+    if [[ "${rc}" -eq 42 ]]; then
+      return 1
+    fi
+    echo "failed to update containerd snapshot annotation setting in ${table_path}" >&2
+    exit "${rc}"
+  }
+
   remove_legacy_cri_snapshotter_table() {
     local tmp_config="${CONTAINERD_CONFIG}.hermes"
 
@@ -303,6 +375,8 @@ enable_cri_snapshotter() {
 EOF_CRI
   fi
 
+  set_disable_snapshot_annotations_in_table "${table_path}" || true
+
   if grep -q '^\[plugins\."io\.containerd\.cri\.v1\.images"\]' "${CONTAINERD_CONFIG}" &&
     ! grep -q '^\[\[plugins\."io\.containerd\.transfer\.v1\.local"\.unpack_config\]\]' "${CONTAINERD_CONFIG}"; then
     cat >>"${CONTAINERD_CONFIG}" <<EOF_TRANSFER
@@ -314,9 +388,21 @@ EOF_TRANSFER
   fi
 }
 
+enable_kubelet_image_service_proxy() {
+  if [[ ! -f "${KUBELET_ENV_FILE}" ]]; then
+    return 0
+  fi
+  if grep -q -- '--image-service-endpoint=' "${KUBELET_ENV_FILE}"; then
+    return 0
+  fi
+  cp "${KUBELET_ENV_FILE}" "${KUBELET_ENV_FILE}.pre-hermes-$(date +%Y%m%d%H%M%S)"
+  sed -i 's#^NODEADM_KUBELET_ARGS=\(.*\)$#NODEADM_KUBELET_ARGS=\1 --image-service-endpoint=unix://'"${HERMES_DAEMON_ADDRESS}"'#' "${KUBELET_ENV_FILE}"
+}
+
 backup_containerd_config
 ensure_proxy_plugin
 enable_cri_snapshotter
+enable_kubelet_image_service_proxy
 
 systemctl daemon-reload
 systemctl enable --now hermes-daemon.service
@@ -324,6 +410,9 @@ systemctl restart hermes-daemon.service
 
 if [[ "${RESTART_CONTAINERD}" == "true" ]]; then
   systemctl restart containerd
+fi
+if [[ -f "${KUBELET_ENV_FILE}" ]]; then
+  systemctl restart kubelet
 fi
 
 systemctl is-active hermes-daemon.service
