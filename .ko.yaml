@@ -9,3 +9,5 @@ builds:
     ldflags:
       - -linkmode external
       - -extldflags "-static"
+      - -X github.com/cloudpilot-ai/hermes/pkg/common/version.Version={{ .Env.GIT_VERSION }}
+      - -X github.com/cloudpilot-ai/hermes/pkg/common/version.Revision={{ .Env.GIT_COMMIT }}
