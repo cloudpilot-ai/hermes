@@ -1,0 +1,98 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: hermespolicies.hermes.cloudpilot.ai
+spec:
+  group: hermes.cloudpilot.ai
+  names:
+    kind: HermesPolicy
+    listKind: HermesPolicyList
+    plural: hermespolicies
+    shortNames:
+      - hp
+    singular: hermespolicy
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Paused
+          type: boolean
+          jsonPath: .spec.paused
+        - name: Ready
+          type: integer
+          jsonPath: .status.ready
+        - name: Failed
+          type: integer
+          jsonPath: .status.failed
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              properties:
+                paused:
+                  type: boolean
+                  default: false
+                imageSelectors:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - imageRegex
+                    properties:
+                      imageRegex:
+                        type: string
+                platforms:
+                  type: array
+                  items:
+                    type: string
+              required:
+                - imageSelectors
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+                  format: int64
+                ready:
+                  type: integer
+                  format: int32
+                failed:
+                  type: integer
+                  format: int32
+                images:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - imageDigestRef
+                      - platform
+                      - phase
+                    properties:
+                      imageDigestRef:
+                        type: string
+                      platform:
+                        type: string
+                      phase:
+                        type: string
+                        enum:
+                          - Building
+                          - Ready
+                          - Failed
+                      lastBuildTime:
+                        type: string
+                        format: date-time
+                      error:
+                        type: string

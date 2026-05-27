@@ -1,0 +1,10 @@
+/cov
+/out
+/release
+/bin
+*.db
+.vscode/
+go.work
+go.work.sum
+/pkg/benchmark/*/output/
+/pkg/benchmark/bin/

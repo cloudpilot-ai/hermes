@@ -1,0 +1,15 @@
+# Minimal node-side config for Hermes-managed SOCI v1 indexes.
+#
+# The snapshotter asks Hermes for SOCI index and zTOC blobs. It still resolves
+# image manifests and lazy-loads layer bytes from the original registry.
+
+[pull_modes]
+  [pull_modes.soci_v1]
+    enable = true
+
+[external_artifact_store]
+  enable = true
+  endpoint = "http://127.0.0.1:30080"
+  timeout_sec = 5
+  platform = "linux/amd64"
+  fallback_to_registry = true

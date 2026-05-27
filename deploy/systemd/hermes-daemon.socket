@@ -1,0 +1,10 @@
+[Unit]
+Description=Hermes daemon containerd snapshotter plugin (socket)
+Documentation=https://github.com/jwcesign/hermes
+
+[Socket]
+ListenStream=/run/hermes-daemon/hermes-daemon.sock
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

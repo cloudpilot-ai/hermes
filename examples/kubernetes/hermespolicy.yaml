@@ -1,0 +1,11 @@
+apiVersion: hermes.cloudpilot.ai/v1alpha1
+kind: HermesPolicy
+metadata:
+  name: prod-large-images
+spec:
+  paused: false
+  imageSelectors:
+    - imageRegex: ".*vllm.*"
+    - imageRegex: ".*nginx.*"
+  platforms:
+    - linux/amd64

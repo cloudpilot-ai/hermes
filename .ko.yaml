@@ -1,0 +1,11 @@
+defaultBaseImage: cgr.dev/chainguard/static:latest
+
+builds:
+  - id: hermes-controller
+    dir: .
+    main: ./cmd/controller
+    env:
+      - CGO_ENABLED=1
+    ldflags:
+      - -linkmode external
+      - -extldflags "-static"
