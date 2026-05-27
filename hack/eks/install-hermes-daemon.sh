@@ -47,6 +47,10 @@ case "${HERMES_DAEMON_URL}" in
 esac
 
 if [[ -n "${HERMES_DAEMON_SHA256}" ]]; then
+  if [[ ! "${HERMES_DAEMON_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "HERMES_DAEMON_SHA256 must be the 64-character hex digest only, not sha256sum output with a filename" >&2
+    exit 1
+  fi
   need_cmd sha256sum
 fi
 
@@ -114,7 +118,7 @@ esac
 
 if [[ -n "${HERMES_DAEMON_SHA256}" ]]; then
   actual_sha256="$(sha256sum "${archive}" | awk '{print $1}')"
-  if [[ "${actual_sha256}" != "${HERMES_DAEMON_SHA256}" ]]; then
+  if [[ "${actual_sha256}" != "${HERMES_DAEMON_SHA256,,}" ]]; then
     echo "daemon archive sha256 mismatch: expected ${HERMES_DAEMON_SHA256}, got ${actual_sha256}" >&2
     exit 1
   fi
