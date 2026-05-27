@@ -1,0 +1,66 @@
+name: Hermes Build
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: ["main"]
+
+jobs:
+  build:
+    name: Build Hermes artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.9"
+          cache: false
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zlib1g-dev
+
+      - name: Config env
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_AK }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SK }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=us-east-2" >> $GITHUB_ENV
+
+      - name: AWS CLI Init
+        uses: unfor19/install-aws-cli-action@v1
+
+      - name: Config ECR
+        run: |
+          aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/cloudpilotai
+
+      - uses: ko-build/setup-ko@v0.6
+
+      - name: Build and publish controller image
+        run: |
+          source hack/env.sh
+
+          export KO_DOCKER_REPO=public.ecr.aws/cloudpilotai/hermes-controller
+          ko build --bare github.com/cloudpilot-ai/hermes/cmd/controller --tags latest
+
+      - name: Build daemon binary
+        run: |
+          source hack/env.sh
+
+          ldflags="-s -w -linkmode external -extldflags '-static' -X github.com/cloudpilot-ai/hermes/pkg/common/version.Version=${GIT_VERSION} -X github.com/cloudpilot-ai/hermes/pkg/common/version.Revision=${GIT_COMMIT}"
+
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -tags "netgo osusergo" -ldflags "${ldflags}" -o hermes-daemon ./cmd/daemon
+          tar -czf hermes-daemon-linux-amd64.tar.gz hermes-daemon
+          sha256sum hermes-daemon-linux-amd64.tar.gz > sha256sums.txt
+
+      - name: Upload daemon binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-daemon-linux-amd64
+          path: |
+            hermes-daemon-linux-amd64.tar.gz
+            sha256sums.txt
