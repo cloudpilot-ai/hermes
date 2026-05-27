@@ -192,12 +192,113 @@ EOF_PROXY
 }
 
 enable_cri_snapshotter() {
-  sed -i 's/snapshotter = "overlayfs"/snapshotter = "soci"/g' "${CONTAINERD_CONFIG}"
+  local table_path
 
-  if ! grep -q 'snapshotter = "soci"' "${CONTAINERD_CONFIG}"; then
+  set_snapshotter_in_table() {
+    local table_path="$1"
+    local tmp_config="${CONTAINERD_CONFIG}.hermes"
+    local rc
+
+    awk -v table_path="${table_path}" '
+      function normalize(line) {
+        normalized = line
+        gsub(/["\047[:space:]]/, "", normalized)
+        return normalized
+      }
+      function is_section(line) {
+        return line ~ /^[[:space:]]*\[/
+      }
+      function is_target_section(line) {
+        return normalize(line) == "[plugins." table_path "]"
+      }
+      function write_snapshotter_if_missing() {
+        if (in_target && !snapshotter_written) {
+          print "  snapshotter = \"soci\""
+          snapshotter_written = 1
+        }
+      }
+      BEGIN {
+        in_target = 0
+        target_seen = 0
+        snapshotter_written = 0
+      }
+      is_section($0) {
+        write_snapshotter_if_missing()
+        in_target = is_target_section($0)
+        if (in_target) {
+          target_seen = 1
+          snapshotter_written = 0
+        }
+        print
+        next
+      }
+      in_target && $0 ~ /^[[:space:]]*snapshotter[[:space:]]*=/ {
+        print "  snapshotter = \"soci\""
+        snapshotter_written = 1
+        next
+      }
+      {
+        print
+      }
+      END {
+        write_snapshotter_if_missing()
+        if (!target_seen) {
+          exit 42
+        }
+      }
+    ' "${CONTAINERD_CONFIG}" >"${tmp_config}" || rc=$?
+
+    if [[ "${rc:-0}" -eq 0 ]]; then
+      mv "${tmp_config}" "${CONTAINERD_CONFIG}"
+      return 0
+    fi
+
+    rm -f "${tmp_config}"
+    if [[ "${rc}" -eq 42 ]]; then
+      return 1
+    fi
+    echo "failed to update containerd snapshotter table ${table_path}" >&2
+    exit "${rc}"
+  }
+
+  remove_legacy_cri_snapshotter_table() {
+    local tmp_config="${CONTAINERD_CONFIG}.hermes"
+
+    awk '
+      function normalize(line) {
+        normalized = line
+        gsub(/["\047[:space:]]/, "", normalized)
+        return normalized
+      }
+      normalize($0) == "[plugins.io.containerd.grpc.v1.cri.containerd]" {
+        skip_legacy = 1
+        next
+      }
+      /^[[:space:]]*\[/ {
+        skip_legacy = 0
+      }
+      !skip_legacy {
+        print
+      }
+    ' "${CONTAINERD_CONFIG}" >"${tmp_config}"
+    mv "${tmp_config}" "${CONTAINERD_CONFIG}"
+  }
+
+  sed -i 's/snapshotter = "overlayfs"/snapshotter = "soci"/g' "${CONTAINERD_CONFIG}"
+  sed -i "s/snapshotter = 'overlayfs'/snapshotter = 'soci'/g" "${CONTAINERD_CONFIG}"
+
+  if grep -q 'io\.containerd\.cri\.v1\.images' "${CONTAINERD_CONFIG}" ||
+    grep -q '^version = 3' "${CONTAINERD_CONFIG}"; then
+    table_path="io.containerd.cri.v1.images"
+    remove_legacy_cri_snapshotter_table
+  else
+    table_path="io.containerd.grpc.v1.cri.containerd"
+  fi
+
+  if ! set_snapshotter_in_table "${table_path}"; then
     cat >>"${CONTAINERD_CONFIG}" <<EOF_CRI
 
-[plugins."io.containerd.grpc.v1.cri".containerd]
+[plugins."${table_path}"]
   snapshotter = "soci"
 EOF_CRI
   fi
