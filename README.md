@@ -1,10 +1,26 @@
+<div style="text-align: center">
+  <p align="center">
+    <img src="docs/assets/hermes-logo.png" alt="Hermes logo" width="180">
+    <br><br>
+  </p>
+  <h1 align="center">Hermes</h1>
+  <p align="center"><i>Policy-driven seamless lazy loading.</i></p>
+</div>
+
 <p align="center">
-  <img src="docs/assets/hermes-logo.png" alt="Hermes logo" width="180">
+  <a href="https://goreportcard.com/report/github.com/cloudpilot-ai/hermes">
+    <img src="https://goreportcard.com/badge/github.com/cloudpilot-ai/hermes" alt="Go Report Card">
+  </a>
+  <a href="./LICENSE">
+    <img src="https://img.shields.io/github/license/cloudpilot-ai/hermes.svg?style=flat-square" alt="License">
+  </a>
+  <a href="https://github.com/cloudpilot-ai/hermes">
+    <img src="https://img.shields.io/github/go-mod/go-version/cloudpilot-ai/hermes?style=flat-square" alt="Go version">
+  </a>
+  <a href="docs/reports/ec2-kind-full-suite-2026-05-27.md">
+    <img src="https://img.shields.io/badge/vLLM%2010.8GB-22.2x%20faster-0B63F6?style=flat-square" alt="Benchmark">
+  </a>
 </p>
-
-<h1 align="center">Hermes</h1>
-
-<p align="center"><strong>Policy-driven seamless lazy loading</strong></p>
 
 Hermes is a Kubernetes-native modified fork of the AWS Labs
 [SOCI Snapshotter](https://github.com/awslabs/soci-snapshotter). It keeps the
