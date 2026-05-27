@@ -30,6 +30,8 @@ jobs:
           echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_AK }}" >> $GITHUB_ENV
           echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SK }}" >> $GITHUB_ENV
           echo "AWS_DEFAULT_REGION=us-east-2" >> $GITHUB_ENV
+          echo "GIT_VERSION=$(git describe --tags --always --dirty)" >> $GITHUB_ENV
+          echo "GIT_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
 
       - name: AWS CLI Init
         uses: unfor19/install-aws-cli-action@v1
@@ -42,15 +44,11 @@ jobs:
 
       - name: Build and publish controller image
         run: |
-          source hack/env.sh
-
           export KO_DOCKER_REPO=public.ecr.aws/cloudpilotai/hermes-controller
           ko build --bare github.com/cloudpilot-ai/hermes/cmd/controller --tags latest
 
       - name: Build daemon binary
         run: |
-          source hack/env.sh
-
           ldflags="-s -w -linkmode external -extldflags '-static' -X github.com/cloudpilot-ai/hermes/pkg/common/version.Version=${GIT_VERSION} -X github.com/cloudpilot-ai/hermes/pkg/common/version.Revision=${GIT_COMMIT}"
 
           CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -tags "netgo osusergo" -ldflags "${ldflags}" -o hermes-daemon ./cmd/daemon
