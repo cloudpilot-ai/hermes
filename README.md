@@ -1,10 +1,9 @@
 <div style="text-align: center">
   <p align="center">
-    <img src="docs/assets/hermes-logo.png" alt="Hermes logo" width="180">
+    <img src="docs/assets/hermes-logo-horizontal.png" alt="Hermes logo" width="420">
     <br><br>
+    <i>Policy-driven seamless lazy loading.</i>
   </p>
-  <h1 align="center">Hermes</h1>
-  <p align="center"><i>Policy-driven seamless lazy loading.</i></p>
 </div>
 
 <p align="center">
