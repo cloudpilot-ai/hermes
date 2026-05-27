@@ -53,12 +53,16 @@ jobs:
 
           CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -tags "netgo osusergo" -ldflags "${ldflags}" -o hermes-daemon ./cmd/daemon
           tar -czf hermes-daemon-linux-amd64.tar.gz hermes-daemon
-          sha256sum hermes-daemon-linux-amd64.tar.gz > sha256sums.txt
+          sha256sum hermes-daemon-linux-amd64.tar.gz | awk '{print $1}' > hermes-daemon-linux-amd64.tar.gz.sha256
 
-      - name: Upload daemon binary
+      - name: Upload daemon tarball
         uses: actions/upload-artifact@v4
         with:
-          name: hermes-daemon-linux-amd64
-          path: |
-            hermes-daemon-linux-amd64.tar.gz
-            sha256sums.txt
+          name: hermes-daemon-linux-amd64-tar-gz
+          path: hermes-daemon-linux-amd64.tar.gz
+
+      - name: Upload daemon checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-daemon-linux-amd64-tar-gz-sha256
+          path: hermes-daemon-linux-amd64.tar.gz.sha256
