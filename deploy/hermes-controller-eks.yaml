@@ -81,8 +81,6 @@ spec:
         app: hermes-controller
     spec:
       serviceAccountName: hermes-controller
-      nodeSelector:
-        karpenter.sh/nodepool: cloudpilot-general
       containers:
         - name: controller
           # Replace with your published controller image.
