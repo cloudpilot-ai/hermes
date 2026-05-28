@@ -119,76 +119,9 @@ and platform.
 
 ## Configuration
 
-Install the CRD before running the controller:
-
-```bash
-kubectl apply -f deploy/hermespolicy-crd.yaml
-```
-
-Create a `HermesPolicy` to decide which Pod images should get SOCI artifacts:
-
-```yaml
-apiVersion: hermes.cloudpilot.ai/v1alpha1
-kind: HermesPolicy
-metadata:
-  name: prod-large-images
-spec:
-  paused: false
-  imageSelectors:
-    - imageRegex: ".*vllm.*"
-  platforms:
-    - linux/amd64
-```
-
-`imageSelectors` are ORed together and currently support `imageRegex` against
-the raw image reference from Pod specs. If `platforms` is empty, the controller
-uses its default `--platform` value. Setting `paused: true` stops new automatic
-enqueueing for the policy without deleting status.
-
-For private registries, keep using normal Kubernetes `imagePullSecrets` on the
-matching Pods. The controller reads those Secrets and uses them when pulling the
-image for index construction.
-
-The controller writes build progress back to `HermesPolicy.status`:
-
-```bash
-kubectl get hermespolicy
-kubectl get hermespolicy prod-large-images -o yaml
-```
-
-The node-side daemon enables controller-managed artifacts with
-`external_artifact_store`:
-
-```toml
-[pull_modes]
-  [pull_modes.soci_v1]
-    enable = true
-
-[external_artifact_store]
-  enable = true
-  endpoint = "http://127.0.0.1:30080"
-  timeout_sec = 5
-  platform = "linux/amd64"
-  fallback_to_registry = true
-```
-
-Hermes exposes the controller with a Kubernetes `NodePort` Service. The sample
-manifest uses `nodePort: 30080`, which is inside the default Kubernetes and EKS
-NodePort range. The node-side daemon runs as a host systemd service and talks
-to the controller through `127.0.0.1:30080`, avoiding Kubernetes Service DNS for
-the host process. When `fallback_to_registry = true`, images without a ready
-Hermes artifact can still fall back to normal registry discovery and startup.
-
-See [examples/daemon/config.toml](examples/daemon/config.toml) for the minimal
-daemon config.
-
-The sample Kubernetes deployment for the controller is in
-[deploy/hermes-controller.yaml](deploy/hermes-controller.yaml), and a sample
-policy is in [examples/kubernetes/hermespolicy.yaml](examples/kubernetes/hermespolicy.yaml).
-The controller deployment uses a PVC for the controller cache and mounts the
-host containerd socket so the controller can pull images and build SOCI
-artifacts. The Service is intentionally `NodePort` so the daemon can use the
-same node-local endpoint on EKS and kind.
+- EKS setup:
+  [Hermes Minimal Fast Pod Ready Acceleration](https://www.cloudpilot.ai/en/blog/hermes-fast-pod-ready-acceleration/)
+- More environment guides will be added over time.
 
 ## Contributing
 
