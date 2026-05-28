@@ -4,6 +4,11 @@ on:
   workflow_dispatch: {}
   push:
     branches: ["main"]
+  release:
+    types: [published]
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -13,6 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+          fetch-depth: 0
           submodules: true
 
       - uses: actions/setup-go@v5
@@ -32,6 +39,11 @@ jobs:
           echo "AWS_DEFAULT_REGION=us-east-2" >> $GITHUB_ENV
           echo "GIT_VERSION=$(git describe --tags --always --dirty)" >> $GITHUB_ENV
           echo "GIT_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            echo "HERMES_RELEASE_TAG=${{ github.event.release.tag_name }}" >> $GITHUB_ENV
+          else
+            echo "HERMES_RELEASE_TAG=" >> $GITHUB_ENV
+          fi
 
       - name: AWS CLI Init
         uses: unfor19/install-aws-cli-action@v1
@@ -45,7 +57,11 @@ jobs:
       - name: Build and publish controller image
         run: |
           export KO_DOCKER_REPO=public.ecr.aws/cloudpilotai/hermes-controller
-          ko build --bare github.com/cloudpilot-ai/hermes/cmd/controller --tags latest
+          ko_tags=(--tags latest)
+          if [[ -n "${HERMES_RELEASE_TAG}" ]]; then
+            ko_tags+=(--tags "${HERMES_RELEASE_TAG}")
+          fi
+          ko build --bare github.com/cloudpilot-ai/hermes/cmd/controller "${ko_tags[@]}"
 
       - name: Build daemon binary
         run: |
@@ -66,3 +82,13 @@ jobs:
         with:
           name: hermes-daemon-linux-amd64-tar-gz-sha256
           path: hermes-daemon-linux-amd64.tar.gz.sha256
+
+      - name: Upload daemon assets to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          generate_release_notes: true
+          files: |
+            hermes-daemon-linux-amd64.tar.gz
+            hermes-daemon-linux-amd64.tar.gz.sha256
