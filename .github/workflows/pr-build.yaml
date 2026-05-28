@@ -1,0 +1,46 @@
+name: PR Build
+
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.9"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build controller
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/hermes-controller ./cmd/controller
+
+      - name: Build daemon
+        run: |
+          mkdir -p bin
+          GIT_VERSION="$(git describe --tags --always --dirty)"
+          GIT_COMMIT="$(git rev-parse HEAD)"
+          ldflags="-s -w -linkmode external -extldflags '-static' -X github.com/cloudpilot-ai/hermes/pkg/common/version.Version=${GIT_VERSION} -X github.com/cloudpilot-ai/hermes/pkg/common/version.Revision=${GIT_COMMIT}"
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -tags "netgo osusergo" -ldflags "${ldflags}" -o bin/hermes-daemon ./cmd/daemon
