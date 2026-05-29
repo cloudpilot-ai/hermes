@@ -120,7 +120,7 @@ and platform.
 ## Configuration
 
 - EKS setup:
-  [Hermes Minimal Fast Pod Ready Acceleration](https://www.cloudpilot.ai/en/blog/hermes-fast-pod-ready-acceleration/)
+  [Hermes: Cut Pod Ready Time from 4m35s to 14s, No Image Changes](https://www.cloudpilot.ai/en/blog/hermes-fast-pod-ready-acceleration/)
 - More environment guides will be added over time.
 
 ## Contributing
