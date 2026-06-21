@@ -29,8 +29,9 @@ var hermesPolicyGVR = schema.GroupVersionResource{
 }
 
 type PolicyBuildTarget struct {
-	Platform    string
-	PolicyNames []string
+	Platform     string
+	PolicyNames  []string
+	Acceleration BuildAcceleration
 }
 
 type PolicyStatusRecorder interface {
@@ -222,11 +223,13 @@ func (s *HermesPolicyStore) MatchImage(image, defaultPlatform string) []PolicyBu
 	}
 	sort.Strings(platforms)
 
+	acceleration := buildAccelerationForImageRef(image)
 	targets := make([]PolicyBuildTarget, 0, len(platforms))
 	for _, platform := range platforms {
 		targets = append(targets, PolicyBuildTarget{
-			Platform:    platform,
-			PolicyNames: uniqueStrings(platformPolicies[platform]),
+			Platform:     platform,
+			PolicyNames:  uniqueStrings(platformPolicies[platform]),
+			Acceleration: acceleration,
 		})
 	}
 	return targets

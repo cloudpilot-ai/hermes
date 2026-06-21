@@ -32,23 +32,39 @@ type hermesResolveResponse struct {
 // stores them in the local content store, then lets the existing lazy mount
 // path continue unchanged for real image layer reads.
 func FetchHermesArtifacts(ctx context.Context, cfg config.ExternalArtifactStoreConfig, imageRef, imageManifestDigest string, localStore store.Store) (*soci.Index, error) {
+	client := &http.Client{Timeout: time.Duration(cfg.TimeoutSec) * time.Second}
+	indexDesc, imageDigestRef, err := ResolveHermesIndex(ctx, client, cfg, imageRef, imageManifestDigest)
+	if err != nil {
+		return nil, err
+	}
+	return FetchHermesArtifactsByDescriptor(ctx, client, cfg, imageDigestRef, indexDesc, localStore)
+}
+
+func ResolveHermesIndex(ctx context.Context, client *http.Client, cfg config.ExternalArtifactStoreConfig, imageRef, imageManifestDigest string) (ocispec.Descriptor, string, error) {
 	refspec, err := reference.Parse(imageRef)
 	if err != nil {
-		return nil, err
+		return ocispec.Descriptor{}, "", err
 	}
 	imageDigestRef := fmt.Sprintf("%s@%s", refspec.Locator, imageManifestDigest)
-
-	client := &http.Client{Timeout: time.Duration(cfg.TimeoutSec) * time.Second}
+	if client == nil {
+		client = &http.Client{Timeout: time.Duration(cfg.TimeoutSec) * time.Second}
+	}
 	resolveResp, err := hermesResolve(ctx, client, cfg, imageDigestRef)
 	if err != nil {
-		return nil, err
+		return ocispec.Descriptor{}, "", err
 	}
+	return resolveResp.SOCIIndex, imageDigestRef, nil
+}
 
+func FetchHermesArtifactsByDescriptor(ctx context.Context, client *http.Client, cfg config.ExternalArtifactStoreConfig, imageDigestRef string, indexDesc ocispec.Descriptor, localStore store.Store) (*soci.Index, error) {
+	if client == nil {
+		client = &http.Client{Timeout: time.Duration(cfg.TimeoutSec) * time.Second}
+	}
 	log.G(ctx).WithField("image", imageDigestRef).
-		WithField("digest", resolveResp.SOCIIndex.Digest.String()).
+		WithField("digest", indexDesc.Digest.String()).
 		Info("fetching index from Hermes artifact store")
 
-	indexBytes, err := hermesFetchBlob(ctx, client, cfg.Endpoint, resolveResp.SOCIIndex.Digest.String())
+	indexBytes, err := hermesFetchBlob(ctx, client, cfg.Endpoint, indexDesc.Digest.String())
 	if err != nil {
 		return nil, fmt.Errorf("unable to fetch Hermes index: %w", err)
 	}
@@ -59,7 +75,6 @@ func FetchHermesArtifacts(ctx context.Context, cfg config.ExternalArtifactStoreC
 		return nil, fmt.Errorf("cannot deserialize Hermes index: %w", err)
 	}
 
-	indexDesc := resolveResp.SOCIIndex
 	indexDesc.Size = tr.CurrentPos()
 
 	ctx, batchDone, err := localStore.BatchOpen(ctx)

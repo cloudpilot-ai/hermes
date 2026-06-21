@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -73,14 +74,34 @@ const (
 	// a subject field. This annotation goes on a SOCI index descriptor in an OCI index,
 	// not in the SOCI index itself.
 	IndexAnnotationImageManifestDigest = "com.amazon.soci.image-manifest-digest"
+	// IndexAnnotationHermesBackgroundFetch controls Hermes daemon background
+	// fetching behavior for an index. "disabled" keeps startup-critical lazy
+	// reads from competing with sequential background fetches.
+	IndexAnnotationHermesBackgroundFetch = "hermes.cloudpilot.ai/background-fetch"
+	// IndexAnnotationHermesPrefetchProfile records the internal prefetch
+	// profile used to generate startup-critical SOCI prefetch artifacts.
+	IndexAnnotationHermesPrefetchProfile = "hermes.cloudpilot.ai/prefetch-profile"
+	// IndexAnnotationHermesSkipFileVerification lets the daemon trust the zTOC
+	// file metadata and skip per-file tar header reads on the startup path.
+	IndexAnnotationHermesSkipFileVerification = "hermes.cloudpilot.ai/skip-file-verification"
+	// IndexAnnotationHermesBackgroundFetchEnabled enables the default daemon
+	// background fetch behavior for layers resolved from the annotated index.
+	IndexAnnotationHermesBackgroundFetchEnabled = "enabled"
+	// IndexAnnotationHermesBackgroundFetchDisabled disables background fetch for
+	// layers resolved from the annotated index.
+	IndexAnnotationHermesBackgroundFetchDisabled = "disabled"
 
 	// ImageAnnotationSociIndexDigest is an annotation on image manifests to specify
 	// a SOCI index digest for the image.
 	ImageAnnotationSociIndexDigest = "com.amazon.soci.index-digest"
 
-	defaultSpanSize            = int64(1 << 22) // 4MiB
-	defaultMinLayerSize        = 10 << 20       // 10MiB
-	defaultBuildToolIdentifier = "AWS SOCI CLI v0.2"
+	defaultSpanSize                 = int64(1 << 22) // 4MiB
+	defaultMinLayerSize             = 10 << 20       // 10MiB
+	defaultBuildToolIdentifier      = "AWS SOCI CLI v0.2"
+	defaultPrefetchMaxSpansPerFile  = 64
+	defaultPrefetchArchiveEdgeSpans = 8
+	prefetchPrioritySync            = 0
+	prefetchPriorityAsync           = 1
 	// emptyJSONObjectDigest is the digest of the content "{}".
 	emptyJSONObjectDigest = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
 	// whiteoutOpaqueDir is a special file that indicates that a directory is opaque and all files and subdirectories
@@ -290,13 +311,17 @@ func GetIndexDescriptorCollection(ctx context.Context, cs content.Store, artifac
 }
 
 type builderConfig struct {
-	spanSize            int64
-	minLayerSize        int64
-	buildToolIdentifier string
-	artifactsDb         *ArtifactsDb
-	optimizations       []Optimization
-	forceRecreateZtocs  bool
-	prefetchPaths       []string
+	spanSize                 int64
+	minLayerSize             int64
+	buildToolIdentifier      string
+	artifactsDb              *ArtifactsDb
+	optimizations            []Optimization
+	forceRecreateZtocs       bool
+	prefetchPaths            []string
+	prefetchMaxSpans         int
+	prefetchMaxSpansPerFile  int
+	prefetchArchiveEdgeSpans int
+	indexAnnotations         map[string]string
 }
 
 func (b *builderConfig) hasOptimization(o Optimization) bool {
@@ -390,7 +415,109 @@ func WithArtifactsDb(db *ArtifactsDb) BuilderOption {
 
 func WithPrefetchPaths(paths []string) BuilderOption {
 	return func(c *builderConfig) error {
-		c.prefetchPaths = paths
+		c.prefetchPaths = normalizePrefetchPatterns(paths)
+		return nil
+	}
+}
+
+func WithPrefetchMaxSpans(maxSpans int) BuilderOption {
+	return func(c *builderConfig) error {
+		if maxSpans < 0 {
+			return fmt.Errorf("prefetch max spans must be >= 0")
+		}
+		c.prefetchMaxSpans = maxSpans
+		return nil
+	}
+}
+
+func WithPrefetchMaxSpansPerFile(maxSpans int) BuilderOption {
+	return func(c *builderConfig) error {
+		if maxSpans < 0 {
+			return fmt.Errorf("prefetch max spans per file must be >= 0")
+		}
+		c.prefetchMaxSpansPerFile = maxSpans
+		return nil
+	}
+}
+
+func WithPrefetchArchiveEdgeSpans(edgeSpans int) BuilderOption {
+	return func(c *builderConfig) error {
+		if edgeSpans < 0 {
+			return fmt.Errorf("prefetch archive edge spans must be >= 0")
+		}
+		c.prefetchArchiveEdgeSpans = edgeSpans
+		return nil
+	}
+}
+
+func normalizePrefetchPatterns(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	normalized := make([]string, 0, len(paths))
+	seen := map[string]struct{}{}
+	for _, path := range paths {
+		original := strings.TrimSpace(path)
+		prefix := strings.HasSuffix(original, "/")
+		cleaned := normalizePrefetchPath(original)
+		if cleaned == "" {
+			continue
+		}
+		if prefix && !strings.HasSuffix(cleaned, "/") {
+			cleaned += "/"
+		}
+		if _, ok := seen[cleaned]; ok {
+			continue
+		}
+		seen[cleaned] = struct{}{}
+		normalized = append(normalized, cleaned)
+	}
+	return normalized
+}
+
+func normalizePrefetchPath(path string) string {
+	cleaned := filepath.Clean(strings.TrimSpace(path))
+	cleaned = strings.TrimLeft(cleaned, "/")
+	if cleaned == "." {
+		return ""
+	}
+	return cleaned
+}
+
+func matchesPrefetchPattern(name, pattern string) bool {
+	name = normalizePrefetchPath(name)
+	if name == "" || pattern == "" {
+		return false
+	}
+	if strings.HasSuffix(pattern, "/") {
+		return strings.HasPrefix(name, pattern)
+	}
+	if strings.HasPrefix(pattern, "*") && !strings.Contains(pattern, "/") {
+		return strings.HasSuffix(name, strings.TrimPrefix(pattern, "*"))
+	}
+	if strings.ContainsAny(pattern, "*?[") {
+		if ok, err := pathpkg.Match(pattern, name); err == nil {
+			return ok
+		}
+	}
+	if strings.HasPrefix(pattern, "*") {
+		return strings.HasSuffix(name, strings.TrimPrefix(pattern, "*"))
+	}
+	return name == pattern
+}
+
+// WithIndexAnnotations adds annotations to the generated SOCI index manifest.
+func WithIndexAnnotations(annotations map[string]string) BuilderOption {
+	return func(c *builderConfig) error {
+		if len(annotations) == 0 {
+			return nil
+		}
+		c.indexAnnotations = make(map[string]string, len(annotations))
+		for key, value := range annotations {
+			if key != "" && value != "" {
+				c.indexAnnotations[key] = value
+			}
+		}
 		return nil
 	}
 }
@@ -450,9 +577,11 @@ type IndexBuilder struct {
 // NewIndexBuilder returns an `IndexBuilder` that is used to create soci indices.
 func NewIndexBuilder(contentStore content.Store, blobStore store.Store, opts ...BuilderOption) (*IndexBuilder, error) {
 	cfg := &builderConfig{
-		spanSize:            defaultSpanSize,
-		minLayerSize:        defaultMinLayerSize,
-		buildToolIdentifier: defaultBuildToolIdentifier,
+		spanSize:                 defaultSpanSize,
+		minLayerSize:             defaultMinLayerSize,
+		buildToolIdentifier:      defaultBuildToolIdentifier,
+		prefetchMaxSpansPerFile:  defaultPrefetchMaxSpansPerFile,
+		prefetchArchiveEdgeSpans: defaultPrefetchArchiveEdgeSpans,
 	}
 
 	for _, opt := range opts {
@@ -543,6 +672,7 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 	// attempt to build a ztoc for each layer
 	sociLayersDesc := make([]*ocispec.Descriptor, len(manifest.Layers))
 	var builtZtocs []*ztocWithLayer // Track built ztocs for prefetch processing
+	var builtZtocsMu sync.Mutex
 	errChan := make(chan error)
 	go func() {
 		var wg sync.WaitGroup
@@ -562,10 +692,12 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 					// actual layer order used for historic consistency
 					sociLayersDesc[i] = desc
 					if toc != nil && enablePrefetch {
+						builtZtocsMu.Lock()
 						builtZtocs = append(builtZtocs, &ztocWithLayer{
 							ztoc:        toc,
 							layerDigest: l.Digest.String(),
 						})
+						builtZtocsMu.Unlock()
 					}
 				}
 			}(i, l)
@@ -589,7 +721,7 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 	}
 
 	var prefetchDescs []*ocispec.Descriptor
-	if len(b.config.prefetchPaths) > 0 && len(builtZtocs) > 0 {
+	if enablePrefetch && len(builtZtocs) > 0 {
 		prefetchDescs = b.buildPrefetchLayer(ctx, builtZtocs, manifest.Layers)
 	}
 
@@ -611,6 +743,9 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 
 	annotations := map[string]string{
 		IndexAnnotationBuildToolIdentifier: b.config.buildToolIdentifier,
+	}
+	for key, value := range b.config.indexAnnotations {
+		annotations[key] = value
 	}
 
 	refers := &ocispec.Descriptor{
@@ -763,10 +898,39 @@ func (b *IndexBuilder) buildPrefetchLayer(ctx context.Context, builtZtocs []*zto
 	}
 
 	layerPrefetchSpansMap := make(map[string][]PrefetchSpan)
-	for _, prefetchPath := range b.config.prefetchPaths {
+	layerSpanSeen := make(map[string]map[compression.SpanID]struct{})
+	totalSpans := 0
+	maxSpans := b.config.prefetchMaxSpans
+
+	addSpan := func(layerDigest string, spanID compression.SpanID, priority int) (bool, bool) {
+		if maxSpans > 0 && totalSpans >= maxSpans {
+			return false, false
+		}
+		seen := layerSpanSeen[layerDigest]
+		if seen == nil {
+			seen = map[compression.SpanID]struct{}{}
+			layerSpanSeen[layerDigest] = seen
+		}
+		if _, ok := seen[spanID]; ok {
+			return true, false
+		}
+		seen[spanID] = struct{}{}
+		layerPrefetchSpansMap[layerDigest] = append(layerPrefetchSpansMap[layerDigest], PrefetchSpan{
+			StartSpan: spanID,
+			EndSpan:   spanID,
+			Priority:  priority,
+		})
+		totalSpans++
+		return maxSpans <= 0 || totalSpans < maxSpans, true
+	}
+
+	stop := false
+	for _, pattern := range b.config.prefetchPaths {
 		found := false
-	PrefetchPathLoop:
 		for i := len(layers) - 1; i >= 0; i-- {
+			if stop {
+				break
+			}
 			layer := layers[i]
 			layerDigest := layer.Digest.String()
 			zwl, ok := layerZtocMap[layerDigest]
@@ -774,34 +938,40 @@ func (b *IndexBuilder) buildPrefetchLayer(ctx context.Context, builtZtocs []*zto
 				continue
 			}
 
+			gz, err := zwl.ztoc.Zinfo()
+			if err != nil {
+				log.G(ctx).WithError(err).Warnf("failed to get zinfo for layer %s", layerDigest)
+				continue
+			}
+
 			for _, metadata := range zwl.ztoc.TOC.FileMetadata {
-				if filepath.Clean(metadata.Name) == prefetchPath {
-					gz, err := zwl.ztoc.Zinfo()
-					if err != nil {
-						log.G(ctx).WithError(err).Warnf("failed to get zinfo for layer %s", layerDigest)
-						break PrefetchPathLoop
+				if stop {
+					break
+				}
+				if !matchesPrefetchPattern(metadata.Name, pattern) {
+					continue
+				}
+				startSpan, endSpan, ok := metadataSpanRange(gz, metadata)
+				if !ok {
+					continue
+				}
+				found = true
+				for _, span := range selectPrefetchSpans(metadata.Name, startSpan, endSpan, b.config.prefetchMaxSpansPerFile, b.config.prefetchArchiveEdgeSpans) {
+					keepGoing, _ := addSpan(layerDigest, span.id, span.priority)
+					if !keepGoing {
+						log.G(ctx).Debugf("prefetch span cap reached maxSpans=%d pattern=%s", maxSpans, pattern)
+						stop = true
+						break
 					}
-
-					fileOffset := int64(metadata.UncompressedOffset)
-					fileSize := int64(metadata.UncompressedSize)
-					startSpan := gz.UncompressedOffsetToSpanID(compression.Offset(fileOffset))
-					endSpan := gz.UncompressedOffsetToSpanID(compression.Offset(fileOffset + fileSize))
-					if endSpan < startSpan {
-						endSpan = startSpan
-					}
-					gz.Close()
-
-					layerPrefetchSpansMap[layerDigest] = append(layerPrefetchSpansMap[layerDigest], PrefetchSpan{
-						StartSpan: startSpan,
-						EndSpan:   endSpan,
-					})
-					found = true
-					break PrefetchPathLoop
 				}
 			}
+			gz.Close()
 		}
 		if !found {
-			log.G(ctx).Warnf("prefetch file %s not found in any layer", prefetchPath)
+			log.G(ctx).Warnf("prefetch path pattern %s not found in any layer", pattern)
+		}
+		if stop {
+			break
 		}
 	}
 
@@ -828,6 +998,110 @@ func (b *IndexBuilder) buildPrefetchLayer(ctx context.Context, builtZtocs []*zto
 	return prefetchDescs
 }
 
+func metadataSpanRange(gz compression.Zinfo, metadata ztoc.FileMetadata) (compression.SpanID, compression.SpanID, bool) {
+	if metadata.UncompressedSize <= 0 {
+		return 0, 0, false
+	}
+	start := metadata.UncompressedOffset
+	end := metadata.UncompressedOffset + metadata.UncompressedSize - 1
+	startSpan := gz.UncompressedOffsetToSpanID(start)
+	endSpan := gz.UncompressedOffsetToSpanID(end)
+	if endSpan < startSpan {
+		endSpan = startSpan
+	}
+	return startSpan, endSpan, true
+}
+
+type selectedPrefetchSpan struct {
+	id       compression.SpanID
+	priority int
+}
+
+func selectPrefetchSpans(name string, startSpan, endSpan compression.SpanID, maxPerFile, archiveEdgeSpans int) []selectedPrefetchSpan {
+	if endSpan < startSpan {
+		endSpan = startSpan
+	}
+	if maxPerFile <= 0 {
+		maxPerFile = int(endSpan-startSpan) + 1
+	}
+	total := int(endSpan-startSpan) + 1
+	archive := prefetchNeedsTail(name)
+	edge := prefetchArchiveSyncEdgeSpans(name, archiveEdgeSpans)
+	if edge < 1 {
+		edge = 1
+	}
+	if total <= maxPerFile && (!archive || total <= edge*2) {
+		out := make([]selectedPrefetchSpan, 0, total)
+		for spanID := startSpan; spanID <= endSpan; spanID++ {
+			out = append(out, selectedPrefetchSpan{id: spanID, priority: prefetchPrioritySync})
+		}
+		return out
+	}
+
+	if !archive {
+		out := make([]selectedPrefetchSpan, 0, maxPerFile)
+		for spanID := startSpan; spanID <= endSpan && len(out) < maxPerFile; spanID++ {
+			out = append(out, selectedPrefetchSpan{id: spanID, priority: prefetchPriorityAsync})
+		}
+		if len(out) > 0 {
+			out[0].priority = prefetchPrioritySync
+		}
+		return out
+	}
+
+	if edge*2 > maxPerFile {
+		edge = maxPerFile / 2
+		if edge < 1 {
+			edge = 1
+		}
+	}
+	out := make([]selectedPrefetchSpan, 0, maxPerFile)
+	seen := map[compression.SpanID]struct{}{}
+	add := func(spanID compression.SpanID, priority int) {
+		if len(out) >= maxPerFile {
+			return
+		}
+		if spanID < startSpan || spanID > endSpan {
+			return
+		}
+		if _, ok := seen[spanID]; ok {
+			return
+		}
+		seen[spanID] = struct{}{}
+		out = append(out, selectedPrefetchSpan{id: spanID, priority: priority})
+	}
+	for i := 0; i < edge; i++ {
+		add(startSpan+compression.SpanID(i), prefetchPrioritySync)
+	}
+	for i := edge - 1; i >= 0; i-- {
+		add(endSpan-compression.SpanID(i), prefetchPrioritySync)
+	}
+	for spanID := startSpan; spanID <= endSpan && len(out) < maxPerFile; spanID++ {
+		add(spanID, prefetchPriorityAsync)
+	}
+	return out
+}
+
+func prefetchNeedsTail(name string) bool {
+	name = normalizePrefetchPath(name)
+	if name == "" {
+		return false
+	}
+	switch pathpkg.Ext(name) {
+	case ".jar", ".zip", ".jmod", ".jimage", ".jsa":
+		return true
+	}
+	return name == "usr/share/opensearch/jdk/lib/modules"
+}
+
+func prefetchArchiveSyncEdgeSpans(name string, configured int) int {
+	name = normalizePrefetchPath(name)
+	if pathpkg.Ext(name) == ".jar" {
+		return 1
+	}
+	return configured
+}
+
 func (b *IndexBuilder) addSociLayerAnnotations(layerDesc *ocispec.Descriptor, ztocDesc *ocispec.Descriptor, toc *ztoc.Ztoc) {
 	ztocDesc.MediaType = SociLayerMediaType
 	ztocDesc.Annotations = map[string]string{
@@ -844,6 +1118,9 @@ func normalizePrefetchSpans(spans []PrefetchSpan) []PrefetchSpan {
 	}
 
 	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].Priority != spans[j].Priority {
+			return spans[i].Priority < spans[j].Priority
+		}
 		if spans[i].StartSpan == spans[j].StartSpan {
 			return spans[i].EndSpan < spans[j].EndSpan
 		}
@@ -854,7 +1131,7 @@ func normalizePrefetchSpans(spans []PrefetchSpan) []PrefetchSpan {
 	current := spans[0]
 	for i := 1; i < len(spans); i++ {
 		s := spans[i]
-		if s.StartSpan <= current.EndSpan+1 {
+		if s.Priority == current.Priority && s.StartSpan <= current.EndSpan+1 {
 			if s.EndSpan > current.EndSpan {
 				current.EndSpan = s.EndSpan
 			}
@@ -889,6 +1166,9 @@ func (b *IndexBuilder) storePrefetchLayer(ctx context.Context, layerDigest strin
 		desc.Annotations = make(map[string]string)
 	}
 	desc.Annotations[IndexAnnotationImageLayerDigest] = layerDigest
+	if profile := b.config.indexAnnotations[IndexAnnotationHermesPrefetchProfile]; profile != "" {
+		desc.Annotations[IndexAnnotationHermesPrefetchProfile] = profile
+	}
 
 	err = b.blobStore.Push(ctx, desc, reader)
 	if err != nil && !store.IsErrAlreadyExists(err) {
@@ -908,8 +1188,21 @@ func (b *IndexBuilder) storePrefetchLayer(ctx context.Context, layerDigest strin
 		return nil, err
 	}
 
-	fmt.Printf("Created prefetch artifact for layer %s: %s\n", layerDigest, desc.Digest)
+	syncSpanCount, asyncSpanCount := countPrefetchSpansByPriority(normalized)
+	fmt.Printf("Created prefetch artifact for layer %s: %s syncSpans=%d asyncSpans=%d ranges=%d\n", layerDigest, desc.Digest, syncSpanCount, asyncSpanCount, len(normalized))
 	return &desc, nil
+}
+
+func countPrefetchSpansByPriority(spans []PrefetchSpan) (syncSpans, asyncSpans int) {
+	for _, span := range spans {
+		count := int(span.EndSpan-span.StartSpan) + 1
+		if span.Priority > 0 {
+			asyncSpans += count
+		} else {
+			syncSpans += count
+		}
+	}
+	return syncSpans, asyncSpans
 }
 
 // getExistingZtocForLayer returns a ztoc descriptor for the provided layer if an entry corresponding to the

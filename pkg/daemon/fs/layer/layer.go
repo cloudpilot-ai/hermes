@@ -41,13 +41,17 @@ package layer
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,11 +83,28 @@ import (
 )
 
 const (
-	defaultResolveResultEntry = 30
-	defaultMaxLRUCacheEntry   = 10
-	defaultMaxCacheFds        = 10
-	memoryCacheType           = "memory"
+	defaultResolveResultEntry         = 30
+	defaultMaxLRUCacheEntry           = 10
+	defaultMaxCacheFds                = 10
+	memoryCacheType                   = "memory"
+	startupHotSpanCacheEntries        = 256
+	defaultStartupMaterializeMaxBytes = 128 << 20
+	defaultStartupMaterializeMaxFiles = 512
+
+	BackgroundFetchEnabled  BackgroundFetchMode = "enabled"
+	BackgroundFetchDisabled BackgroundFetchMode = "disabled"
 )
+
+var (
+	startupMaterializeMaxBytes = envInt64("HERMES_STARTUP_MATERIALIZE_MAX_BYTES", defaultStartupMaterializeMaxBytes)
+	startupMaterializeMaxFiles = envInt("HERMES_STARTUP_MATERIALIZE_MAX_FILES", defaultStartupMaterializeMaxFiles)
+)
+
+type BackgroundFetchMode string
+
+type BackgroundFetchPolicy struct {
+	Mode BackgroundFetchMode
+}
 
 // Layer represents a layer.
 type Layer interface {
@@ -248,8 +269,8 @@ func (r *Resolver) Evict(name string) {
 
 // Resolve resolves a layer based on the passed layer blob information.
 // prefetchDesc is optional - if provided, it will be used for prefetching spans
-func (r *Resolver) Resolve(ctx context.Context, hosts []docker.RegistryHost, refspec reference.Spec, desc, sociDesc ocispec.Descriptor, opCounter *FuseOperationCounter, disableVerification bool, prefetchDesc *ocispec.Descriptor, metadataOpts ...metadata.Option) (_ Layer, retErr error) {
-	name := refspec.String() + "/" + desc.Digest.String()
+func (r *Resolver) Resolve(ctx context.Context, hosts []docker.RegistryHost, refspec reference.Spec, desc, sociDesc ocispec.Descriptor, opCounter *FuseOperationCounter, disableVerification bool, prefetchDesc *ocispec.Descriptor, bgPolicy BackgroundFetchPolicy, metadataOpts ...metadata.Option) (_ Layer, retErr error) {
+	name := resolveCacheKey(refspec, desc, sociDesc, prefetchDesc, bgPolicy, disableVerification)
 
 	// Wait if resolving this layer is already running. The result
 	// can hopefully get from the LRU cache.
@@ -341,6 +362,7 @@ func (r *Resolver) Resolve(ctx context.Context, hosts []docker.RegistryHost, ref
 			commonmetrics.MeasureLatencyInMilliseconds(commonmetrics.InitMetadataStore, desc.Digest, start)
 		},
 	}
+	fileMetadata := ztoc.TOC.FileMetadata
 	meta, err := r.metadataStore(sr, ztoc.TOC, append(metadataOpts, metadata.WithTelemetry(&telemetry))...)
 	if err != nil {
 		return nil, err
@@ -352,23 +374,39 @@ func (r *Resolver) Resolve(ctx context.Context, hosts []docker.RegistryHost, ref
 	if err != nil {
 		return nil, fmt.Errorf("error creating span manager: %w", err)
 	}
+	startupProfile := hasStartupPrefetchProfile(prefetchDesc)
 	var bgLayerResolver backgroundfetcher.Resolver
-	if r.bgFetcher != nil {
+	if r.bgFetcher == nil {
+		// Background fetcher disabled globally.
+	} else if bgPolicy.Mode == BackgroundFetchDisabled {
+		log.G(ctx).WithField("layerDigest", desc.Digest.String()).Debug("background fetch disabled for layer by SOCI index annotation")
+	} else {
 		bgLayerResolver = backgroundfetcher.NewSequentialResolver(desc.Digest, spanManager)
 		r.bgFetcher.Add(bgLayerResolver)
 	}
 
-	if err := r.executePrefetch(ctx, spanManager, prefetchDesc); err != nil {
-		log.G(ctx).WithError(err).Warn("Failed to execute prefetch, continuing without prefetch")
+	materialized, err := r.materializeStartupFiles(ctx, desc.Digest, spanManager, fileMetadata, startupProfile)
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("Failed to materialize startup files, continuing without local materialized files")
+	}
+	var asyncPrefetchWG *sync.WaitGroup
+	if materialized == nil || len(materialized.Files) == 0 {
+		asyncPrefetchWG, err = r.executePrefetch(ctx, spanManager, prefetchDesc)
+		if err != nil {
+			log.G(ctx).WithError(err).Warn("Failed to execute prefetch, continuing without prefetch")
+		}
+	}
+	if shouldEnableStartupHotCache(startupProfile, materialized) {
+		spanManager.EnableHotCache(startupHotSpanCacheEntries)
 	}
 
-	vr, err := reader.NewReader(meta, desc.Digest, spanManager, disableVerification)
+	vr, err := reader.NewReaderWithMaterializedFiles(meta, desc.Digest, spanManager, disableVerification, materialized, startupProfile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read layer: %w", err)
 	}
 	disableXAttrs := getDisableXAttrAnnotation(sociDesc)
 	// Combine layer information together and cache it.
-	l := newLayer(r, desc, name, blobR, vr, bgLayerResolver, opCounter, disableXAttrs)
+	l := newLayer(r, desc, name, blobR, vr, bgLayerResolver, asyncPrefetchWG, opCounter, disableXAttrs)
 	r.layerCacheMu.Lock()
 	cachedL, done2, added := r.layerCache.Add(name, l)
 	r.layerCacheMu.Unlock()
@@ -420,6 +458,7 @@ func newLayer(
 	blob *blobRef,
 	r reader.Reader,
 	bgResolver backgroundfetcher.Resolver,
+	asyncPrefetchWG *sync.WaitGroup,
 	opCounter *FuseOperationCounter,
 	disableXAttrs bool,
 ) *layer {
@@ -430,6 +469,7 @@ func newLayer(
 		blob:                 blob,
 		r:                    r,
 		bgResolver:           bgResolver,
+		asyncPrefetchWG:      asyncPrefetchWG,
 		fuseOperationCounter: opCounter,
 		disableXAttrs:        disableXAttrs,
 	}
@@ -441,7 +481,8 @@ type layer struct {
 	cacheRefKey string
 	blob        *blobRef
 
-	bgResolver backgroundfetcher.Resolver
+	bgResolver      backgroundfetcher.Resolver
+	asyncPrefetchWG *sync.WaitGroup
 
 	r reader.Reader
 
@@ -508,6 +549,9 @@ func (l *layer) close() error {
 	if l.bgResolver != nil {
 		l.bgResolver.Close()
 	}
+	if l.asyncPrefetchWG != nil {
+		l.asyncPrefetchWG.Wait()
+	}
 	defer l.blob.done() // Close reader first, then close the blob
 	return l.r.Close()
 }
@@ -552,32 +596,62 @@ type readerAtFunc func([]byte, int64) (int, error)
 
 func (f readerAtFunc) ReadAt(p []byte, offset int64) (int, error) { return f(p, offset) }
 
-func (r *Resolver) executePrefetch(ctx context.Context, spanManager *spanmanager.SpanManager, prefetchDesc *ocispec.Descriptor) error {
+func (r *Resolver) executePrefetch(ctx context.Context, spanManager *spanmanager.SpanManager, prefetchDesc *ocispec.Descriptor) (*sync.WaitGroup, error) {
 	if prefetchDesc == nil {
-		return nil
+		return nil, nil
 	}
 
-	if !r.config.PrefetchConfig.Enable {
+	if !r.config.PrefetchConfig.Enable && prefetchDesc.Annotations[soci.IndexAnnotationHermesPrefetchProfile] == "" {
 		log.G(ctx).Debug("Prefetch is disabled in config, skipping prefetch")
-		return nil
+		return nil, nil
 	}
 
 	prefetchArtifact, err := r.loadPrefetchArtifact(ctx, prefetchDesc)
 	if err != nil {
 		if errors.Is(err, soci.ErrEmptyPrefetchArtifact) {
 			log.G(ctx).Debug("Prefetch artifact is empty, skipping prefetch")
-			return nil
+			return nil, nil
 		}
-		return fmt.Errorf("failed to load prefetch artifact: %w", err)
+		return nil, fmt.Errorf("failed to load prefetch artifact: %w", err)
 	}
 
-	var spansToFetch []compression.SpanID
+	var syncSpans []compression.SpanID
+	var asyncSpans []compression.SpanID
+	startupProfile := prefetchDesc.Annotations[soci.IndexAnnotationHermesPrefetchProfile] != ""
 	for _, prefetchSpan := range prefetchArtifact.PrefetchSpans {
 		for spanID := prefetchSpan.StartSpan; spanID <= prefetchSpan.EndSpan; spanID++ {
-			spansToFetch = append(spansToFetch, spanID)
+			if prefetchSpan.Priority > 0 {
+				if !startupProfile {
+					asyncSpans = append(asyncSpans, spanID)
+				}
+			} else {
+				syncSpans = append(syncSpans, spanID)
+			}
 		}
 	}
 
+	if len(syncSpans) == 0 && len(asyncSpans) == 0 {
+		return nil, nil
+	}
+	if err := r.executePrefetchSpans(ctx, spanManager, syncSpans); err != nil {
+		return nil, err
+	}
+	if len(asyncSpans) > 0 {
+		asyncWG := &sync.WaitGroup{}
+		asyncWG.Add(1)
+		asyncCtx := context.WithoutCancel(ctx)
+		go func() {
+			defer asyncWG.Done()
+			if err := r.executePrefetchSpans(asyncCtx, spanManager, asyncSpans); err != nil {
+				log.G(asyncCtx).WithError(err).Debug("async prefetch failed")
+			}
+		}()
+		return asyncWG, nil
+	}
+	return nil, nil
+}
+
+func (r *Resolver) executePrefetchSpans(ctx context.Context, spanManager *spanmanager.SpanManager, spansToFetch []compression.SpanID) error {
 	if len(spansToFetch) == 0 {
 		return nil
 	}
@@ -596,13 +670,25 @@ func (r *Resolver) executePrefetch(ctx context.Context, spanManager *spanmanager
 	}
 
 	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var retErr error
+	recordErr := func(spanID compression.SpanID, err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		retErr = errors.Join(retErr, fmt.Errorf("prefetch span %d: %w", spanID, err))
+		errMu.Unlock()
+	}
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for spanID := range spanChan {
-				spanManager.ResolveSpan(spanID)
+				if err := spanManager.ResolveSpan(spanID); err != nil {
+					recordErr(spanID, err)
+				}
 			}
 		}()
 	}
@@ -613,7 +699,254 @@ func (r *Resolver) executePrefetch(ctx context.Context, spanManager *spanmanager
 	close(spanChan)
 
 	wg.Wait()
-	return nil
+	return retErr
+}
+
+type startupMaterializeCandidate struct {
+	name     string
+	offset   compression.Offset
+	size     compression.Offset
+	priority int
+}
+
+func (r *Resolver) materializeStartupFiles(ctx context.Context, layerDigest digest.Digest, spanManager *spanmanager.SpanManager, files []ztoc.FileMetadata, enabled bool) (*reader.MaterializedFileSet, error) {
+	if !enabled || len(files) == 0 {
+		return nil, nil
+	}
+
+	candidates := startupMaterializeCandidates(files)
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	rootParent := filepath.Join(r.rootDir, "materialized")
+	if err := os.MkdirAll(rootParent, 0700); err != nil {
+		return nil, err
+	}
+	root, err := os.MkdirTemp(rootParent, "startup-*")
+	if err != nil {
+		return nil, err
+	}
+
+	out := &reader.MaterializedFileSet{
+		Root:  root,
+		Files: make(map[string]string),
+	}
+	var totalBytes int64
+	var totalFiles int
+	var retErr error
+	for _, candidate := range candidates {
+		if totalFiles >= startupMaterializeMaxFiles {
+			break
+		}
+		if startupMaterializeMaxBytes <= 0 || startupMaterializeMaxFiles <= 0 {
+			break
+		}
+		if totalBytes+int64(candidate.size) > startupMaterializeMaxBytes {
+			continue
+		}
+		localPath, err := materializeStartupFile(ctx, spanManager, root, candidate)
+		if err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("%s: %w", candidate.name, err))
+			continue
+		}
+		out.Files[candidate.name] = localPath
+		totalBytes += int64(candidate.size)
+		totalFiles++
+	}
+	if len(out.Files) == 0 {
+		_ = os.RemoveAll(root)
+		out = nil
+	}
+	log.G(ctx).WithFields(logrus.Fields{
+		"layerDigest":       layerDigest.String(),
+		"materializedFiles": totalFiles,
+		"materializedBytes": totalBytes,
+	}).Info("materialized startup files for local reads")
+	return out, retErr
+}
+
+func startupMaterializeCandidates(files []ztoc.FileMetadata) []startupMaterializeCandidate {
+	candidates := make([]startupMaterializeCandidate, 0)
+	seen := map[string]struct{}{}
+	for _, file := range files {
+		name, ok := reader.MaterializedFileKey(file.Name)
+		if !ok || file.Type != "reg" || file.UncompressedSize <= 0 || !isStartupMaterializePath(name) {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		candidates = append(candidates, startupMaterializeCandidate{
+			name:     name,
+			offset:   file.UncompressedOffset,
+			size:     file.UncompressedSize,
+			priority: startupMaterializePriority(name),
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].priority != candidates[j].priority {
+			return candidates[i].priority < candidates[j].priority
+		}
+		if candidates[i].size != candidates[j].size {
+			return candidates[i].size > candidates[j].size
+		}
+		return candidates[i].name < candidates[j].name
+	})
+	return candidates
+}
+
+func startupMaterializePriority(name string) int {
+	name = normalizeStartupMaterializePath(name)
+	switch {
+	case name == "usr/share/opensearch/jdk/lib/modules":
+		return 0
+	case strings.HasPrefix(name, "usr/share/opensearch/bin/"):
+		return 1
+	case strings.HasPrefix(name, "usr/share/opensearch/config/"):
+		return 2
+	case strings.HasPrefix(name, "usr/share/opensearch/jdk/bin/"):
+		return 3
+	case strings.HasPrefix(name, "usr/share/opensearch/jdk/lib/") && strings.HasSuffix(name, ".so"):
+		return 4
+	case strings.HasPrefix(name, "usr/share/opensearch/lib/"):
+		return 5
+	case strings.HasPrefix(name, "usr/share/opensearch/modules/"):
+		return 6
+	case strings.HasPrefix(name, "usr/share/opensearch/plugins/"):
+		return 7
+	default:
+		return 8
+	}
+}
+
+func isStartupMaterializePath(name string) bool {
+	name = normalizeStartupMaterializePath(name)
+	if name == "" || name == "." {
+		return false
+	}
+	if reader.IsStartupHotPath(name) {
+		return true
+	}
+	if strings.HasPrefix(name, "usr/share/opensearch/bin/") ||
+		strings.HasPrefix(name, "usr/share/opensearch/config/") ||
+		strings.HasPrefix(name, "usr/share/opensearch/jdk/bin/") ||
+		strings.HasPrefix(name, "usr/share/opensearch/jdk/conf/") {
+		return true
+	}
+	if strings.HasPrefix(name, "usr/share/opensearch/jdk/lib/") {
+		return strings.HasSuffix(name, ".so") ||
+			strings.HasSuffix(name, ".cfg") ||
+			strings.Contains(name, "/security/") ||
+			strings.Contains(name, "/tzdb.dat")
+	}
+	if strings.HasPrefix(name, "usr/share/opensearch/modules/") ||
+		strings.HasPrefix(name, "usr/share/opensearch/plugins/") {
+		return strings.HasSuffix(name, ".jar") ||
+			strings.HasSuffix(name, ".properties") ||
+			strings.HasSuffix(name, ".policy") ||
+			strings.HasSuffix(name, ".yml") ||
+			strings.HasSuffix(name, ".yaml")
+	}
+	return false
+}
+
+func materializeStartupFile(ctx context.Context, spanManager *spanmanager.SpanManager, root string, candidate startupMaterializeCandidate) (string, error) {
+	r, err := spanManager.GetContents(candidate.offset, candidate.offset+candidate.size)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+
+	sum := sha256.Sum256([]byte(candidate.name))
+	localPath := filepath.Join(root, hex.EncodeToString(sum[:])+".file")
+	tmpPath := localPath + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return "", err
+	}
+	written, copyErr := io.Copy(f, r)
+	closeErr := f.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmpPath)
+		return "", copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return "", closeErr
+	}
+	if written != int64(candidate.size) {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("materialized %d bytes, expected %d", written, candidate.size)
+	}
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", err
+	}
+	log.G(ctx).WithFields(logrus.Fields{
+		"path": candidate.name,
+		"size": candidate.size,
+	}).Debug("materialized startup file")
+	return localPath, nil
+}
+
+func normalizeStartupMaterializePath(name string) string {
+	key, ok := reader.MaterializedFileKey(name)
+	if !ok {
+		return ""
+	}
+	return key
+}
+
+func envInt64(name string, fallback int64) int64 {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envInt(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func hasStartupPrefetchProfile(prefetchDesc *ocispec.Descriptor) bool {
+	return prefetchDesc != nil && prefetchDesc.Annotations[soci.IndexAnnotationHermesPrefetchProfile] != ""
+}
+
+func shouldEnableStartupHotCache(startupProfile bool, materialized *reader.MaterializedFileSet) bool {
+	return startupProfile && (materialized == nil || len(materialized.Files) == 0)
+}
+
+func resolveCacheKey(refspec reference.Spec, desc, sociDesc ocispec.Descriptor, prefetchDesc *ocispec.Descriptor, bgPolicy BackgroundFetchPolicy, disableVerification bool) string {
+	prefetchKey := ""
+	prefetchProfile := ""
+	if prefetchDesc != nil {
+		prefetchKey = prefetchDesc.Digest.String()
+		prefetchProfile = prefetchDesc.Annotations[soci.IndexAnnotationHermesPrefetchProfile]
+	}
+	return strings.Join([]string{
+		refspec.String(),
+		desc.Digest.String(),
+		sociDesc.Digest.String(),
+		prefetchKey,
+		prefetchProfile,
+		string(bgPolicy.Mode),
+		strconv.FormatBool(disableVerification),
+	}, "|")
 }
 
 func (r *Resolver) loadPrefetchArtifact(ctx context.Context, prefetchDesc *ocispec.Descriptor) (*soci.PrefetchArtifact, error) {

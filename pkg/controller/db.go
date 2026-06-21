@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -17,6 +18,38 @@ import (
 type Store struct {
 	db *sql.DB
 }
+
+const imageArtifactsTableSQL = `CREATE TABLE image_artifacts (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	source_image_ref TEXT NOT NULL,
+	image_digest_ref TEXT NOT NULL,
+	image_manifest_digest TEXT NOT NULL,
+	image_config_digest TEXT NOT NULL DEFAULT '',
+	platform TEXT NOT NULL,
+	acceleration_key TEXT NOT NULL DEFAULT '',
+	index_digest TEXT NOT NULL DEFAULT '',
+	index_media_type TEXT NOT NULL DEFAULT '',
+	index_size INTEGER NOT NULL DEFAULT 0,
+	soci_version TEXT NOT NULL DEFAULT 'v1',
+	span_size INTEGER NOT NULL DEFAULT 0,
+	min_layer_size INTEGER NOT NULL DEFAULT 0,
+	build_status TEXT NOT NULL,
+	build_started_at TEXT,
+	build_finished_at TEXT,
+	error TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(image_digest_ref, platform, acceleration_key)
+)`
+
+const artifactLayersTableSQL = `CREATE TABLE artifact_layers (
+	image_artifact_id INTEGER NOT NULL,
+	layer_digest TEXT NOT NULL,
+	ztoc_digest TEXT NOT NULL,
+	ztoc_size INTEGER NOT NULL,
+	PRIMARY KEY(image_artifact_id, layer_digest),
+	FOREIGN KEY(image_artifact_id) REFERENCES image_artifacts(id) ON DELETE CASCADE
+)`
 
 func OpenStore(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
@@ -43,27 +76,7 @@ func (s *Store) init(ctx context.Context) error {
 		`PRAGMA journal_mode = WAL;`,
 		`PRAGMA synchronous = NORMAL;`,
 		`PRAGMA foreign_keys = ON;`,
-		`CREATE TABLE IF NOT EXISTS image_artifacts (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			source_image_ref TEXT NOT NULL,
-			image_digest_ref TEXT NOT NULL,
-			image_manifest_digest TEXT NOT NULL,
-			image_config_digest TEXT NOT NULL DEFAULT '',
-			platform TEXT NOT NULL,
-			index_digest TEXT NOT NULL DEFAULT '',
-			index_media_type TEXT NOT NULL DEFAULT '',
-			index_size INTEGER NOT NULL DEFAULT 0,
-			soci_version TEXT NOT NULL DEFAULT 'v1',
-			span_size INTEGER NOT NULL DEFAULT 0,
-			min_layer_size INTEGER NOT NULL DEFAULT 0,
-			build_status TEXT NOT NULL,
-			build_started_at TEXT,
-			build_finished_at TEXT,
-			error TEXT NOT NULL DEFAULT '',
-			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(image_digest_ref, platform)
-		);`,
+		`CREATE TABLE IF NOT EXISTS ` + strings.TrimPrefix(imageArtifactsTableSQL, "CREATE TABLE "),
 		`CREATE TABLE IF NOT EXISTS artifact_blobs (
 			digest TEXT PRIMARY KEY,
 			media_type TEXT NOT NULL,
@@ -71,14 +84,7 @@ func (s *Store) init(ctx context.Context) error {
 			content BLOB NOT NULL,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);`,
-		`CREATE TABLE IF NOT EXISTS artifact_layers (
-			image_artifact_id INTEGER NOT NULL,
-			layer_digest TEXT NOT NULL,
-			ztoc_digest TEXT NOT NULL,
-			ztoc_size INTEGER NOT NULL,
-			PRIMARY KEY(image_artifact_id, layer_digest),
-			FOREIGN KEY(image_artifact_id) REFERENCES image_artifacts(id) ON DELETE CASCADE
-		);`,
+		`CREATE TABLE IF NOT EXISTS ` + strings.TrimPrefix(artifactLayersTableSQL, "CREATE TABLE "),
 		`CREATE INDEX IF NOT EXISTS image_artifacts_status_idx ON image_artifacts(build_status);`,
 	}
 	for _, stmt := range stmts {
@@ -86,27 +92,120 @@ func (s *Store) init(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.ensureColumn(ctx, "image_artifacts", "acceleration_key", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureImageArtifactsAccelerationIdentity(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (s *Store) MarkBuilding(ctx context.Context, task BuildTask, imageDigestRef, manifestDigest string, cfg Config) (bool, error) {
+func (s *Store) ensureImageArtifactsAccelerationIdentity(ctx context.Context) error {
+	var schema string
+	if err := s.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'image_artifacts'`).Scan(&schema); err != nil {
+		return err
+	}
+	normalized := strings.Join(strings.Fields(schema), " ")
+	if strings.Contains(normalized, "UNIQUE(image_digest_ref, platform, acceleration_key)") {
+		return nil
+	}
+	return s.migrateImageArtifactsAccelerationIdentity(ctx)
+}
+
+func (s *Store) migrateImageArtifactsAccelerationIdentity(ctx context.Context) (retErr error) {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA foreign_keys = OFF;`); err != nil {
+		return err
+	}
+	defer func() {
+		_, err := s.db.ExecContext(context.Background(), `PRAGMA foreign_keys = ON;`)
+		if retErr == nil {
+			retErr = err
+		}
+	}()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`ALTER TABLE artifact_layers RENAME TO artifact_layers_old`,
+		`ALTER TABLE image_artifacts RENAME TO image_artifacts_old`,
+		imageArtifactsTableSQL,
+		artifactLayersTableSQL,
+		`INSERT INTO image_artifacts (
+			id, source_image_ref, image_digest_ref, image_manifest_digest, image_config_digest,
+			platform, acceleration_key, index_digest, index_media_type, index_size, soci_version,
+			span_size, min_layer_size, build_status, build_started_at, build_finished_at,
+			error, created_at, updated_at
+		)
+		SELECT id, source_image_ref, image_digest_ref, image_manifest_digest, image_config_digest,
+			platform, COALESCE(acceleration_key, ''), index_digest, index_media_type, index_size, soci_version,
+			span_size, min_layer_size, build_status, build_started_at, build_finished_at,
+			error, created_at, updated_at
+		FROM image_artifacts_old`,
+		`INSERT INTO artifact_layers(image_artifact_id, layer_digest, ztoc_digest, ztoc_size)
+		SELECT image_artifact_id, layer_digest, ztoc_digest, ztoc_size
+		FROM artifact_layers_old
+		WHERE image_artifact_id IN (SELECT id FROM image_artifacts)`,
+		`DROP TABLE artifact_layers_old`,
+		`DROP TABLE image_artifacts_old`,
+		`CREATE INDEX IF NOT EXISTS image_artifacts_status_idx ON image_artifacts(build_status)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition)
+	return err
+}
+
+func (s *Store) MarkBuilding(ctx context.Context, task BuildTask, imageDigestRef, manifestDigest string, cfg Config, accelerationKey string) (bool, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.db.ExecContext(ctx, `INSERT INTO image_artifacts (
-		source_image_ref, image_digest_ref, image_manifest_digest, platform,
+		source_image_ref, image_digest_ref, image_manifest_digest, platform, acceleration_key,
 		span_size, min_layer_size, build_status, build_started_at, error, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?)
-	ON CONFLICT(image_digest_ref, platform) DO UPDATE SET
-		source_image_ref=excluded.source_image_ref,
-		image_manifest_digest=excluded.image_manifest_digest,
-		span_size=excluded.span_size,
-		min_layer_size=excluded.min_layer_size,
-		build_status=excluded.build_status,
-		build_started_at=excluded.build_started_at,
-		error='',
-		updated_at=excluded.updated_at
-	WHERE image_artifacts.build_status != ?`,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)
+		ON CONFLICT(image_digest_ref, platform, acceleration_key) DO UPDATE SET
+			source_image_ref=excluded.source_image_ref,
+			image_manifest_digest=excluded.image_manifest_digest,
+			span_size=excluded.span_size,
+			min_layer_size=excluded.min_layer_size,
+			build_status=excluded.build_status,
+			build_started_at=excluded.build_started_at,
+			error='',
+			updated_at=excluded.updated_at
+		WHERE image_artifacts.build_status != ?`,
 		task.SourceImageRef, imageDigestRef, manifestDigest, task.Platform,
-		cfg.SpanSize, cfg.MinLayerSize, statusBuilding, now, now, statusReady)
+		accelerationKey, cfg.SpanSize, cfg.MinLayerSize, statusBuilding, now, now, statusReady)
 	if err != nil {
 		return false, err
 	}
@@ -117,27 +216,27 @@ func (s *Store) MarkBuilding(ctx context.Context, task BuildTask, imageDigestRef
 	return rows > 0, nil
 }
 
-func (s *Store) MarkFailed(ctx context.Context, sourceImageRef, imageDigestRef, platform string, buildErr error) error {
+func (s *Store) MarkFailed(ctx context.Context, sourceImageRef, imageDigestRef, platform, accelerationKey string, buildErr error) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	errText := ""
 	if buildErr != nil {
 		errText = buildErr.Error()
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO image_artifacts (
-		source_image_ref, image_digest_ref, image_manifest_digest, platform,
+		source_image_ref, image_digest_ref, image_manifest_digest, platform, acceleration_key,
 		build_status, build_finished_at, error, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	ON CONFLICT(image_digest_ref, platform) DO UPDATE SET
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(image_digest_ref, platform, acceleration_key) DO UPDATE SET
 		source_image_ref=excluded.source_image_ref,
 		build_status=excluded.build_status,
 		build_finished_at=excluded.build_finished_at,
 		error=excluded.error,
 		updated_at=excluded.updated_at`,
-		sourceImageRef, imageDigestRef, "", platform, statusFailed, now, errText, now)
+		sourceImageRef, imageDigestRef, "", platform, accelerationKey, statusFailed, now, errText, now)
 	return err
 }
 
-func (s *Store) PutReady(ctx context.Context, artifact Artifact, indexDesc ocispec.Descriptor, indexBytes []byte, ztocs []ocispec.Descriptor, ztocBytes map[string][]byte, layers []LayerArtifact, cfg Config) error {
+func (s *Store) PutReady(ctx context.Context, artifact Artifact, indexDesc ocispec.Descriptor, indexBytes []byte, ztocs []ocispec.Descriptor, ztocBytes map[string][]byte, layers []LayerArtifact, cfg Config, accelerationKey string) error {
 	if err := verifyBlob(indexDesc.Digest, indexBytes); err != nil {
 		return fmt.Errorf("index digest verification failed: %w", err)
 	}
@@ -156,10 +255,10 @@ func (s *Store) PutReady(ctx context.Context, artifact Artifact, indexDesc ocisp
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := tx.ExecContext(ctx, `INSERT INTO image_artifacts (
 		source_image_ref, image_digest_ref, image_manifest_digest, image_config_digest,
-		platform, index_digest, index_media_type, index_size, soci_version,
+		platform, acceleration_key, index_digest, index_media_type, index_size, soci_version,
 		span_size, min_layer_size, build_status, build_finished_at, error, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'v1', ?, ?, ?, ?, '', ?)
-	ON CONFLICT(image_digest_ref, platform) DO UPDATE SET
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', ?, ?, ?, ?, '', ?)
+	ON CONFLICT(image_digest_ref, platform, acceleration_key) DO UPDATE SET
 		source_image_ref=excluded.source_image_ref,
 		image_manifest_digest=excluded.image_manifest_digest,
 		image_config_digest=excluded.image_config_digest,
@@ -174,19 +273,18 @@ func (s *Store) PutReady(ctx context.Context, artifact Artifact, indexDesc ocisp
 		error='',
 		updated_at=excluded.updated_at`,
 		artifact.SourceImageRef, artifact.ImageDigestRef, artifact.ImageManifestDigest, artifact.ImageConfigDigest,
-		artifact.Platform, indexDesc.Digest.String(), indexDesc.MediaType, indexDesc.Size,
+		artifact.Platform, accelerationKey, indexDesc.Digest.String(), indexDesc.MediaType, indexDesc.Size,
 		cfg.SpanSize, cfg.MinLayerSize, statusReady, now, now)
 	if err != nil {
 		return err
 	}
 
-	id, err := res.LastInsertId()
-	if err != nil || id == 0 {
-		err = tx.QueryRowContext(ctx, `SELECT id FROM image_artifacts WHERE image_digest_ref = ? AND platform = ?`,
-			artifact.ImageDigestRef, artifact.Platform).Scan(&id)
-		if err != nil {
-			return err
-		}
+	_ = res
+
+	var id int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM image_artifacts WHERE image_digest_ref = ? AND platform = ? AND acceleration_key = ?`,
+		artifact.ImageDigestRef, artifact.Platform, accelerationKey).Scan(&id); err != nil {
+		return err
 	}
 
 	if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO artifact_blobs(digest, media_type, size, content, created_at) VALUES (?, ?, ?, ?, ?)`,
@@ -214,15 +312,15 @@ func (s *Store) PutReady(ctx context.Context, artifact Artifact, indexDesc ocisp
 	return tx.Commit()
 }
 
-func (s *Store) Resolve(ctx context.Context, imageDigestRef, platform string) (*ResolveResponse, error) {
+func (s *Store) Resolve(ctx context.Context, imageDigestRef, platform, accelerationKey string) (*ResolveResponse, error) {
 	var a Artifact
 	err := s.db.QueryRowContext(ctx, `SELECT id, source_image_ref, image_digest_ref, image_manifest_digest, image_config_digest,
-		platform, index_digest, index_media_type, index_size, build_status, error
+		platform, acceleration_key, index_digest, index_media_type, index_size, build_status, error
 		FROM image_artifacts
-		WHERE image_digest_ref = ? AND platform = ? AND build_status = ?`,
-		imageDigestRef, platform, statusReady).Scan(
+		WHERE image_digest_ref = ? AND platform = ? AND build_status = ? AND acceleration_key = ?`,
+		imageDigestRef, platform, statusReady, accelerationKey).Scan(
 		&a.ID, &a.SourceImageRef, &a.ImageDigestRef, &a.ImageManifestDigest, &a.ImageConfigDigest,
-		&a.Platform, &a.IndexDigest, &a.IndexMediaType, &a.IndexSize, &a.Status, &a.Error)
+		&a.Platform, &a.AccelerationKey, &a.IndexDigest, &a.IndexMediaType, &a.IndexSize, &a.Status, &a.Error)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
@@ -265,12 +363,12 @@ func (s *Store) Resolve(ctx context.Context, imageDigestRef, platform string) (*
 	}, nil
 }
 
-func (s *Store) HasReady(ctx context.Context, imageDigestRef, platform string) (bool, error) {
+func (s *Store) HasReady(ctx context.Context, imageDigestRef, platform, accelerationKey string) (bool, error) {
 	var exists int
 	err := s.db.QueryRowContext(ctx, `SELECT 1
 		FROM image_artifacts
-		WHERE image_digest_ref = ? AND platform = ? AND build_status = ?
-		LIMIT 1`, imageDigestRef, platform, statusReady).Scan(&exists)
+		WHERE image_digest_ref = ? AND platform = ? AND build_status = ? AND acceleration_key = ?
+		LIMIT 1`, imageDigestRef, platform, statusReady, accelerationKey).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -287,7 +385,7 @@ func (s *Store) GetBlob(ctx context.Context, dgst string) (mediaType string, siz
 
 func (s *Store) ListRecent(ctx context.Context, limit int) ([]Artifact, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, source_image_ref, image_digest_ref, image_manifest_digest, image_config_digest,
-		platform, index_digest, index_media_type, index_size, build_status, error
+		platform, acceleration_key, index_digest, index_media_type, index_size, build_status, error
 		FROM image_artifacts ORDER BY updated_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -298,7 +396,7 @@ func (s *Store) ListRecent(ctx context.Context, limit int) ([]Artifact, error) {
 	for rows.Next() {
 		var a Artifact
 		if err := rows.Scan(&a.ID, &a.SourceImageRef, &a.ImageDigestRef, &a.ImageManifestDigest, &a.ImageConfigDigest,
-			&a.Platform, &a.IndexDigest, &a.IndexMediaType, &a.IndexSize, &a.Status, &a.Error); err != nil {
+			&a.Platform, &a.AccelerationKey, &a.IndexDigest, &a.IndexMediaType, &a.IndexSize, &a.Status, &a.Error); err != nil {
 			return nil, err
 		}
 		out = append(out, a)

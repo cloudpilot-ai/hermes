@@ -54,7 +54,8 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing image")
 		return
 	}
-	resp, err := s.store.Resolve(r.Context(), image, platform)
+	accelerationKey := buildAccelerationForImageRef(image).Key()
+	resp, err := s.store.Resolve(r.Context(), image, platform, accelerationKey)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("index not ready for image=%s platform=%s", image, platform))
 		return
