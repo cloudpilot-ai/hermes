@@ -870,14 +870,40 @@ func (fs *filesystem) getSociContext(ctx context.Context, imageRef, indexDigest,
 	if err != nil {
 		return nil, err
 	}
+	c, err := fs.initSociContext(ctx, imageManifestDigest, client, source)
+	if err == nil {
+		return c, nil
+	}
+	if !source.hermes || !fs.externalArtifactStore.FallbackToRegistry {
+		return nil, err
+	}
+
+	hermesErr := err
+	hermesIndexDigest := source.desc.Digest.String()
+	fs.sociContexts.Delete(sociContextCacheKey(imageManifestDigest, hermesIndexDigest))
+	log.G(ctx).WithError(hermesErr).Warn("Hermes artifact store fetch failed; falling back to registry")
+	source, err = fs.resolveRegistrySociIndexSource(ctx, imageRef, indexDigest, imageManifestDigest, client)
+	if err != nil {
+		return nil, fmt.Errorf("%w: error trying Hermes artifact store: %v; registry fallback: %w", snapshot.ErrNoIndex, hermesErr, err)
+	}
+	c, err = fs.initSociContext(ctx, imageManifestDigest, client, source)
+	if err != nil {
+		return nil, fmt.Errorf("%w: error trying Hermes artifact store: %v; registry fallback: %w", snapshot.ErrNoIndex, hermesErr, err)
+	}
+	return c, nil
+}
+
+func (fs *filesystem) initSociContext(ctx context.Context, imageManifestDigest string, client *http.Client, source sociIndexSource) (*sociContext, error) {
 	cacheKey := sociContextCacheKey(imageManifestDigest, source.desc.Digest.String())
 	cAny, _ := fs.sociContexts.LoadOrStore(cacheKey, &sociContext{})
 	c, ok := cAny.(*sociContext)
 	if !ok {
-		return nil, fmt.Errorf("could not load index: fs soci context is invalid type for %s", indexDigest)
+		return nil, fmt.Errorf("could not load index: fs soci context is invalid type for %s", source.desc.Digest)
 	}
-	err = c.Init(ctx, fs, imageManifestDigest, client, source)
-	return c, err
+	if err := c.Init(ctx, fs, imageManifestDigest, client, source); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 func sociContextCacheKey(imageManifestDigest, indexDigest string) string {
@@ -885,16 +911,6 @@ func sociContextCacheKey(imageManifestDigest, indexDigest string) string {
 }
 
 func (fs *filesystem) resolveSociIndexSource(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (sociIndexSource, error) {
-	refspec, err := reference.Parse(imageRef)
-	if err != nil {
-		return sociIndexSource{}, err
-	}
-
-	remoteStore, err := newRemoteStore(refspec, client)
-	if err != nil {
-		return sociIndexSource{}, err
-	}
-
 	if fs.externalArtifactStore.Enable {
 		indexDesc, imageDigestRef, err := ResolveHermesIndex(ctx, nil, fs.externalArtifactStore, imageRef, imageManifestDigest)
 		if err == nil {
@@ -908,6 +924,20 @@ func (fs *filesystem) resolveSociIndexSource(ctx context.Context, imageRef, inde
 			return sociIndexSource{}, fmt.Errorf("%w: error trying Hermes artifact store: %w", snapshot.ErrNoIndex, err)
 		}
 		log.G(ctx).WithError(err).Warn("Hermes artifact store miss; falling back to registry")
+	}
+
+	return fs.resolveRegistrySociIndexSource(ctx, imageRef, indexDigest, imageManifestDigest, client)
+}
+
+func (fs *filesystem) resolveRegistrySociIndexSource(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (sociIndexSource, error) {
+	refspec, err := reference.Parse(imageRef)
+	if err != nil {
+		return sociIndexSource{}, err
+	}
+
+	remoteStore, err := newRemoteStore(refspec, client)
+	if err != nil {
+		return sociIndexSource{}, err
 	}
 
 	indexDesc, err := fs.findSociIndexDesc(ctx, imageManifestDigest, indexDigest, remoteStore)

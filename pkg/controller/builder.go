@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	sociapi "github.com/cloudpilot-ai/hermes/pkg/common/soci"
 	socistore "github.com/cloudpilot-ai/hermes/pkg/common/soci/store"
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/reference"
@@ -106,7 +108,6 @@ func (b *Builder) Build(ctx context.Context, task BuildTask) error {
 		task.Platform = b.cfg.Platform
 	}
 	accelerationKey := task.Acceleration.Key()
-	buildConfig := b.effectiveBuildConfig(task)
 	buildCtx, cancel := context.WithTimeout(ctx, b.cfg.BuildTimeout)
 	defer cancel()
 
@@ -144,11 +145,13 @@ func (b *Builder) Build(ctx context.Context, task BuildTask) error {
 		}
 	}
 
-	imageDigestRef, manifestDigest, configDigest, err := b.resolveImage(buildCtx, client, img, task.SourceImageRef, task.Platform)
+	imageDigestRef, manifestDigest, configDigest, imageConfig, err := b.resolveImage(buildCtx, client, img, task.SourceImageRef, task.Platform)
 	if err != nil {
 		_ = b.store.MarkFailed(ctx, task.SourceImageRef, task.SourceImageRef, task.Platform, accelerationKey, err)
 		return err
 	}
+	task.Acceleration = task.Acceleration.WithImageConfig(imageConfig.Config)
+	buildConfig := b.effectiveBuildConfig(task)
 
 	ready, err := b.store.HasReady(ctx, imageDigestRef, task.Platform, accelerationKey)
 	if err != nil {
@@ -331,25 +334,32 @@ func (b *Builder) pullImage(ctx context.Context, client *containerd.Client, imag
 	return img, nil
 }
 
-func (b *Builder) resolveImage(ctx context.Context, client *containerd.Client, img containerd.Image, imageRef, platform string) (imageDigestRef, manifestDigest, configDigest string, err error) {
+func (b *Builder) resolveImage(ctx context.Context, client *containerd.Client, img containerd.Image, imageRef, platform string) (imageDigestRef, manifestDigest, configDigest string, imageConfig ocispec.Image, err error) {
 	plat, err := platforms.Parse(platform)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", ocispec.Image{}, err
 	}
 	matcher := platforms.OnlyStrict(plat)
 	manifestDesc, err := sociapi.GetImageManifestDescriptor(ctx, client.ContentStore(), img.Target(), matcher)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", ocispec.Image{}, err
 	}
 	manifest, err := images.Manifest(ctx, client.ContentStore(), img.Target(), matcher)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", ocispec.Image{}, err
+	}
+	configBytes, err := content.ReadBlob(ctx, client.ContentStore(), manifest.Config)
+	if err != nil {
+		return "", "", "", ocispec.Image{}, err
+	}
+	if err := json.Unmarshal(configBytes, &imageConfig); err != nil {
+		return "", "", "", ocispec.Image{}, err
 	}
 	refspec, err := reference.Parse(imageRef)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", ocispec.Image{}, err
 	}
-	return fmt.Sprintf("%s@%s", refspec.Locator, manifestDesc.Digest.String()), manifestDesc.Digest.String(), manifest.Config.Digest.String(), nil
+	return fmt.Sprintf("%s@%s", refspec.Locator, manifestDesc.Digest.String()), manifestDesc.Digest.String(), manifest.Config.Digest.String(), imageConfig, nil
 }
 
 func (b *Builder) effectiveBuildConfig(task BuildTask) Config {

@@ -43,10 +43,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -385,7 +387,7 @@ func (r *Resolver) Resolve(ctx context.Context, hosts []docker.RegistryHost, ref
 		r.bgFetcher.Add(bgLayerResolver)
 	}
 
-	materialized, err := r.materializeStartupFiles(ctx, desc.Digest, spanManager, fileMetadata, startupProfile)
+	materialized, err := r.materializeStartupFiles(ctx, desc.Digest, spanManager, fileMetadata, startupProfile, startupMaterializePatterns(prefetchDesc))
 	if err != nil {
 		log.G(ctx).WithError(err).Warn("Failed to materialize startup files, continuing without local materialized files")
 	}
@@ -709,12 +711,12 @@ type startupMaterializeCandidate struct {
 	priority int
 }
 
-func (r *Resolver) materializeStartupFiles(ctx context.Context, layerDigest digest.Digest, spanManager *spanmanager.SpanManager, files []ztoc.FileMetadata, enabled bool) (*reader.MaterializedFileSet, error) {
+func (r *Resolver) materializeStartupFiles(ctx context.Context, layerDigest digest.Digest, spanManager *spanmanager.SpanManager, files []ztoc.FileMetadata, enabled bool, patterns []string) (*reader.MaterializedFileSet, error) {
 	if !enabled || len(files) == 0 {
 		return nil, nil
 	}
 
-	candidates := startupMaterializeCandidates(files)
+	candidates := startupMaterializeCandidates(files, patterns)
 	if len(candidates) == 0 {
 		return nil, nil
 	}
@@ -766,12 +768,12 @@ func (r *Resolver) materializeStartupFiles(ctx context.Context, layerDigest dige
 	return out, retErr
 }
 
-func startupMaterializeCandidates(files []ztoc.FileMetadata) []startupMaterializeCandidate {
+func startupMaterializeCandidates(files []ztoc.FileMetadata, patterns []string) []startupMaterializeCandidate {
 	candidates := make([]startupMaterializeCandidate, 0)
 	seen := map[string]struct{}{}
 	for _, file := range files {
 		name, ok := reader.MaterializedFileKey(file.Name)
-		if !ok || file.Type != "reg" || file.UncompressedSize <= 0 || !isStartupMaterializePath(name) {
+		if !ok || file.Type != "reg" || file.UncompressedSize <= 0 || !isStartupMaterializePath(name, patterns) {
 			continue
 		}
 		if _, ok := seen[name]; ok {
@@ -800,56 +802,127 @@ func startupMaterializeCandidates(files []ztoc.FileMetadata) []startupMaterializ
 func startupMaterializePriority(name string) int {
 	name = normalizeStartupMaterializePath(name)
 	switch {
-	case name == "usr/share/opensearch/jdk/lib/modules":
+	case isRuntimeBundlePath(name):
 		return 0
-	case strings.HasPrefix(name, "usr/share/opensearch/bin/"):
+	case isSystemStartupPath(name):
 		return 1
-	case strings.HasPrefix(name, "usr/share/opensearch/config/"):
+	case isExecutableStartupPath(name):
 		return 2
-	case strings.HasPrefix(name, "usr/share/opensearch/jdk/bin/"):
+	case isSharedLibraryPath(name):
 		return 3
-	case strings.HasPrefix(name, "usr/share/opensearch/jdk/lib/") && strings.HasSuffix(name, ".so"):
+	case isConfigStartupPath(name):
 		return 4
-	case strings.HasPrefix(name, "usr/share/opensearch/lib/"):
+	case reader.IsStartupHotPath(name):
 		return 5
-	case strings.HasPrefix(name, "usr/share/opensearch/modules/"):
-		return 6
-	case strings.HasPrefix(name, "usr/share/opensearch/plugins/"):
-		return 7
 	default:
 		return 8
 	}
 }
 
-func isStartupMaterializePath(name string) bool {
+func isStartupMaterializePath(name string, patterns []string) bool {
 	name = normalizeStartupMaterializePath(name)
 	if name == "" || name == "." {
+		return false
+	}
+	if len(patterns) > 0 {
+		for _, pattern := range patterns {
+			if matchesStartupMaterializePattern(name, pattern) {
+				return true
+			}
+		}
 		return false
 	}
 	if reader.IsStartupHotPath(name) {
 		return true
 	}
-	if strings.HasPrefix(name, "usr/share/opensearch/bin/") ||
-		strings.HasPrefix(name, "usr/share/opensearch/config/") ||
-		strings.HasPrefix(name, "usr/share/opensearch/jdk/bin/") ||
-		strings.HasPrefix(name, "usr/share/opensearch/jdk/conf/") {
+	return isSystemStartupPath(name) ||
+		isExecutableStartupPath(name) ||
+		isSharedLibraryPath(name) ||
+		isConfigStartupPath(name) ||
+		isRuntimeBundlePath(name)
+}
+
+func isSystemStartupPath(name string) bool {
+	switch name {
+	case "etc/ld.so.cache", "etc/nsswitch.conf", "etc/passwd", "etc/group",
+		"etc/hosts", "etc/resolv.conf", "etc/localtime", "etc/timezone",
+		"usr/bin/env", "bin/sh", "bin/bash":
 		return true
 	}
-	if strings.HasPrefix(name, "usr/share/opensearch/jdk/lib/") {
-		return strings.HasSuffix(name, ".so") ||
-			strings.HasSuffix(name, ".cfg") ||
-			strings.Contains(name, "/security/") ||
-			strings.Contains(name, "/tzdb.dat")
+	return strings.HasPrefix(name, "etc/ssl/certs/") ||
+		strings.HasPrefix(name, "etc/pki/") ||
+		strings.HasPrefix(name, "usr/share/ca-certificates/") ||
+		strings.HasPrefix(name, "usr/share/zoneinfo/")
+}
+
+func isExecutableStartupPath(name string) bool {
+	segments := strings.Split(name, "/")
+	if len(segments) < 2 {
+		return false
 	}
-	if strings.HasPrefix(name, "usr/share/opensearch/modules/") ||
-		strings.HasPrefix(name, "usr/share/opensearch/plugins/") {
-		return strings.HasSuffix(name, ".jar") ||
-			strings.HasSuffix(name, ".properties") ||
-			strings.HasSuffix(name, ".policy") ||
-			strings.HasSuffix(name, ".yml") ||
-			strings.HasSuffix(name, ".yaml")
+	for i := 0; i < len(segments)-1; i++ {
+		if segments[i] == "bin" || segments[i] == "sbin" {
+			return true
+		}
 	}
 	return false
+}
+
+func isSharedLibraryPath(name string) bool {
+	base := pathpkg.Base(name)
+	return strings.Contains(base, ".so") ||
+		strings.HasPrefix(base, "ld-linux")
+}
+
+func isConfigStartupPath(name string) bool {
+	ext := pathpkg.Ext(name)
+	switch ext {
+	case ".conf", ".cfg", ".properties", ".policy", ".yml", ".yaml", ".json", ".xml", ".options", ".ini", ".toml":
+		return hasStartupMetadataSegment(name)
+	default:
+		return false
+	}
+}
+
+func isRuntimeBundlePath(name string) bool {
+	return strings.HasSuffix(name, "/lib/modules") ||
+		strings.HasSuffix(name, "/lib/tzdb.dat") ||
+		strings.Contains(name, "/lib/security/") ||
+		strings.HasSuffix(name, ".jimage") ||
+		strings.HasSuffix(name, ".jsa")
+}
+
+func hasStartupMetadataSegment(name string) bool {
+	for _, segment := range strings.Split(name, "/") {
+		switch segment {
+		case "config", "conf", "etc", "lib", "modules", "plugins", "extensions":
+			return true
+		}
+	}
+	return false
+}
+
+func matchesStartupMaterializePattern(name, pattern string) bool {
+	name = normalizeStartupMaterializePath(name)
+	pattern = normalizeStartupMaterializePattern(pattern)
+	if name == "" || pattern == "" {
+		return false
+	}
+	if strings.HasSuffix(pattern, "/") {
+		return strings.HasPrefix(name, pattern)
+	}
+	if strings.HasPrefix(pattern, "*") && !strings.Contains(pattern, "/") {
+		return strings.HasSuffix(name, strings.TrimPrefix(pattern, "*"))
+	}
+	if strings.ContainsAny(pattern, "*?[") {
+		if ok, err := pathpkg.Match(pattern, name); err == nil {
+			return ok
+		}
+	}
+	if strings.HasPrefix(pattern, "*") {
+		return strings.HasSuffix(name, strings.TrimPrefix(pattern, "*"))
+	}
+	return name == pattern
 }
 
 func materializeStartupFile(ctx context.Context, spanManager *spanmanager.SpanManager, root string, candidate startupMaterializeCandidate) (string, error) {
@@ -897,6 +970,50 @@ func normalizeStartupMaterializePath(name string) string {
 		return ""
 	}
 	return key
+}
+
+func startupMaterializePatterns(prefetchDesc *ocispec.Descriptor) []string {
+	if prefetchDesc == nil || len(prefetchDesc.Annotations) == 0 {
+		return nil
+	}
+	raw := strings.TrimSpace(prefetchDesc.Annotations[soci.IndexAnnotationHermesPrefetchPaths])
+	if raw == "" {
+		return nil
+	}
+	var decoded []string
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(decoded))
+	seen := map[string]struct{}{}
+	for _, pattern := range decoded {
+		pattern = normalizeStartupMaterializePattern(pattern)
+		if pattern == "" {
+			continue
+		}
+		if _, ok := seen[pattern]; ok {
+			continue
+		}
+		seen[pattern] = struct{}{}
+		out = append(out, pattern)
+	}
+	return out
+}
+
+func normalizeStartupMaterializePattern(pattern string) string {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return ""
+	}
+	prefix := strings.HasSuffix(pattern, "/")
+	cleaned := pathpkg.Clean(strings.TrimLeft(pattern, "/"))
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return ""
+	}
+	if prefix && !strings.HasSuffix(cleaned, "/") {
+		cleaned += "/"
+	}
+	return cleaned
 }
 
 func envInt64(name string, fallback int64) int64 {

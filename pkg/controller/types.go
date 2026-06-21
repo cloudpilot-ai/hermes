@@ -41,7 +41,8 @@ type BuildTask struct {
 }
 
 type BuildAcceleration struct {
-	Profile string
+	Profile              string
+	PrefetchPathPatterns []string
 }
 
 type RegistryAuth struct {

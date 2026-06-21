@@ -13,7 +13,7 @@ import (
 )
 
 func TestResolveCacheKeyIncludesStartupProfileInputs(t *testing.T) {
-	refspec, err := reference.Parse("docker.io/opensearchproject/opensearch:2.19.1")
+	refspec, err := reference.Parse("ghcr.io/acme/example:1.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,13 +22,13 @@ func TestResolveCacheKeyIncludesStartupProfileInputs(t *testing.T) {
 	oldPrefetch := &ocispec.Descriptor{
 		Digest: digest.FromString("prefetch-old"),
 		Annotations: map[string]string{
-			soci.IndexAnnotationHermesPrefetchProfile: "opensearch-jvm-v1",
+			soci.IndexAnnotationHermesPrefetchProfile: "startup-local-v1",
 		},
 	}
 	newPrefetch := &ocispec.Descriptor{
 		Digest: digest.FromString("prefetch-new"),
 		Annotations: map[string]string{
-			soci.IndexAnnotationHermesPrefetchProfile: "opensearch-jvm-v2",
+			soci.IndexAnnotationHermesPrefetchProfile: "startup-local-v2",
 		},
 	}
 
@@ -39,28 +39,35 @@ func TestResolveCacheKeyIncludesStartupProfileInputs(t *testing.T) {
 	}
 }
 
-func TestStartupMaterializeCandidatesPrioritizeCriticalOpenSearchFiles(t *testing.T) {
+func TestStartupMaterializeCandidatesPrioritizeCriticalStartupFiles(t *testing.T) {
 	files := []ztoc.FileMetadata{
-		{Name: "usr/share/opensearch/plugins/security/plugin-security.jar", Type: "reg", UncompressedOffset: 300, UncompressedSize: 10},
-		{Name: "usr/share/opensearch/jdk/lib/modules", Type: "reg", UncompressedOffset: 100, UncompressedSize: 100},
-		{Name: "usr/share/opensearch/config/opensearch.yml", Type: "reg", UncompressedOffset: 200, UncompressedSize: 1},
-		{Name: "usr/share/opensearch/data/nodes/0/ignored", Type: "reg", UncompressedOffset: 400, UncompressedSize: 1},
-		{Name: "usr/share/opensearch/lib/opensearch.jar", Type: "reg", UncompressedOffset: 500, UncompressedSize: 20},
-		{Name: "usr/share/opensearch/modules/analysis-common/plugin-descriptor.properties", Type: "reg", UncompressedOffset: 600, UncompressedSize: 1},
-		{Name: "usr/share/opensearch/modules/analysis-common", Type: "dir", UncompressedOffset: 700, UncompressedSize: 0},
+		{Name: "opt/acme/plugins/security/plugin-security.jar", Type: "reg", UncompressedOffset: 300, UncompressedSize: 10},
+		{Name: "opt/acme/runtime/lib/modules", Type: "reg", UncompressedOffset: 100, UncompressedSize: 100},
+		{Name: "opt/acme/config/app.yml", Type: "reg", UncompressedOffset: 200, UncompressedSize: 1},
+		{Name: "opt/acme/data/nodes/0/ignored", Type: "reg", UncompressedOffset: 400, UncompressedSize: 1},
+		{Name: "opt/acme/lib/app.jar", Type: "reg", UncompressedOffset: 500, UncompressedSize: 20},
+		{Name: "opt/acme/modules/analysis/plugin-descriptor.properties", Type: "reg", UncompressedOffset: 600, UncompressedSize: 1},
+		{Name: "opt/acme/modules/analysis", Type: "dir", UncompressedOffset: 700, UncompressedSize: 0},
 	}
 
-	got := startupMaterializeCandidates(files)
+	patterns := []string{
+		"opt/acme/config/",
+		"opt/acme/lib/*.jar",
+		"opt/acme/modules/*/plugin-descriptor.properties",
+		"opt/acme/plugins/*/*.jar",
+		"opt/acme/runtime/lib/modules",
+	}
+	got := startupMaterializeCandidates(files, patterns)
 	names := make([]string, 0, len(got))
 	for _, item := range got {
 		names = append(names, item.name)
 	}
 	want := []string{
-		"usr/share/opensearch/jdk/lib/modules",
-		"usr/share/opensearch/config/opensearch.yml",
-		"usr/share/opensearch/lib/opensearch.jar",
-		"usr/share/opensearch/modules/analysis-common/plugin-descriptor.properties",
-		"usr/share/opensearch/plugins/security/plugin-security.jar",
+		"opt/acme/runtime/lib/modules",
+		"opt/acme/config/app.yml",
+		"opt/acme/modules/analysis/plugin-descriptor.properties",
+		"opt/acme/lib/app.jar",
+		"opt/acme/plugins/security/plugin-security.jar",
 	}
 	if len(names) != len(want) {
 		t.Fatalf("candidates = %#v, want %#v", names, want)
@@ -77,37 +84,37 @@ func TestStartupMaterializePathMatcher(t *testing.T) {
 		path string
 		want bool
 	}{
-		{path: "usr/share/opensearch/bin/opensearch", want: true},
-		{path: "usr/share/opensearch/config/jvm.options", want: true},
-		{path: "usr/share/opensearch/jdk/lib/server/libjvm.so", want: true},
-		{path: "usr/share/opensearch/jdk/lib/modules", want: true},
-		{path: "usr/share/opensearch/modules/analysis-common/plugin-descriptor.properties", want: true},
-		{path: "usr/share/opensearch/plugins/security/security.policy", want: true},
-		{path: "usr/share/opensearch/plugins/security/model.bin", want: false},
-		{path: "var/log/opensearch/server.log", want: false},
+		{path: "opt/acme/bin/server", want: true},
+		{path: "opt/acme/config/app.yml", want: true},
+		{path: "opt/acme/runtime/lib/server/libvm.so", want: true},
+		{path: "opt/acme/runtime/lib/modules", want: true},
+		{path: "opt/acme/modules/analysis/plugin-descriptor.properties", want: true},
+		{path: "opt/acme/plugins/security/security.policy", want: true},
+		{path: "opt/acme/plugins/security/model.bin", want: false},
+		{path: "var/log/app/server.log", want: false},
 	}
 	for _, tt := range tests {
-		if got := isStartupMaterializePath(tt.path); got != tt.want {
+		if got := isStartupMaterializePath(tt.path, nil); got != tt.want {
 			t.Fatalf("isStartupMaterializePath(%q) = %v, want %v", tt.path, got, tt.want)
 		}
 	}
 }
 
 func TestNormalizeStartupMaterializePath(t *testing.T) {
-	if got := normalizeStartupMaterializePath("usr/share/opensearch/lib/opensearch.jar"); got != "usr/share/opensearch/lib/opensearch.jar" {
+	if got := normalizeStartupMaterializePath("opt/acme/lib/app.jar"); got != "opt/acme/lib/app.jar" {
 		t.Fatalf("normalized path = %q", got)
 	}
-	if got := normalizeStartupMaterializePath("/../usr/share/opensearch/lib/opensearch.jar"); got != "" {
+	if got := normalizeStartupMaterializePath("/../opt/acme/lib/app.jar"); got != "" {
 		t.Fatalf("malformed path normalized to %q", got)
 	}
 }
 
 func TestStartupMaterializeCandidateDedupesNormalizedNames(t *testing.T) {
 	files := []ztoc.FileMetadata{
-		{Name: "usr/share/opensearch/lib/opensearch.jar", Type: "reg", UncompressedOffset: compression.Offset(1), UncompressedSize: 1},
-		{Name: "usr/share/opensearch/lib/opensearch.jar", Type: "reg", UncompressedOffset: compression.Offset(2), UncompressedSize: 1},
+		{Name: "opt/acme/lib/app.jar", Type: "reg", UncompressedOffset: compression.Offset(1), UncompressedSize: 1},
+		{Name: "opt/acme/lib/app.jar", Type: "reg", UncompressedOffset: compression.Offset(2), UncompressedSize: 1},
 	}
-	got := startupMaterializeCandidates(files)
+	got := startupMaterializeCandidates(files, nil)
 	if len(got) != 1 {
 		t.Fatalf("candidate count = %d, want 1: %#v", len(got), got)
 	}
@@ -115,9 +122,9 @@ func TestStartupMaterializeCandidateDedupesNormalizedNames(t *testing.T) {
 
 func TestStartupMaterializeCandidateRejectsMalformedTarNames(t *testing.T) {
 	files := []ztoc.FileMetadata{
-		{Name: "/../usr/share/opensearch/lib/opensearch.jar", Type: "reg", UncompressedOffset: compression.Offset(1), UncompressedSize: 1},
+		{Name: "/../opt/acme/lib/app.jar", Type: "reg", UncompressedOffset: compression.Offset(1), UncompressedSize: 1},
 	}
-	if got := startupMaterializeCandidates(files); len(got) != 0 {
+	if got := startupMaterializeCandidates(files, nil); len(got) != 0 {
 		t.Fatalf("malformed candidate was accepted: %#v", got)
 	}
 }
@@ -130,7 +137,7 @@ func TestShouldEnableStartupHotCacheOnlyWithoutMaterializedFiles(t *testing.T) {
 		t.Fatal("hot cache disabled when startup profile has no materialized files")
 	}
 	materialized := &reader.MaterializedFileSet{
-		Files: map[string]string{"usr/share/opensearch/jdk/lib/modules": "/tmp/modules"},
+		Files: map[string]string{"opt/acme/runtime/lib/modules": "/tmp/modules"},
 	}
 	if shouldEnableStartupHotCache(true, materialized) {
 		t.Fatal("hot cache enabled despite materialized startup files")

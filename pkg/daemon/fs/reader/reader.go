@@ -418,15 +418,32 @@ func IsStartupHotPath(name string) bool {
 	if name == "." || name == "" {
 		return false
 	}
-	if name == "usr/share/opensearch/jdk/lib/modules" {
-		return true
-	}
-	if !strings.HasSuffix(name, ".jar") {
+	return isRuntimeBundlePath(name) || isStartupArchivePath(name)
+}
+
+func isStartupArchivePath(name string) bool {
+	switch pathpkg.Ext(name) {
+	case ".jar", ".zip", ".jmod", ".jimage", ".jsa":
+		return hasStartupArchiveSegment(name)
+	default:
 		return false
 	}
-	return strings.HasPrefix(name, "usr/share/opensearch/lib/") ||
-		strings.HasPrefix(name, "usr/share/opensearch/modules/") ||
-		strings.HasPrefix(name, "usr/share/opensearch/plugins/")
+}
+
+func isRuntimeBundlePath(name string) bool {
+	return strings.HasSuffix(name, "/lib/modules") ||
+		strings.HasSuffix(name, "/lib/tzdb.dat") ||
+		strings.Contains(name, "/lib/security/")
+}
+
+func hasStartupArchiveSegment(name string) bool {
+	for _, segment := range strings.Split(name, "/") {
+		switch segment {
+		case "lib", "modules", "plugins", "extensions":
+			return true
+		}
+	}
+	return false
 }
 
 func normalizedTarPath(name string) string {

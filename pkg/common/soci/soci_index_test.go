@@ -4,15 +4,15 @@ import "testing"
 
 func TestNormalizePrefetchPatterns(t *testing.T) {
 	got := normalizePrefetchPatterns([]string{
-		"/usr/share/opensearch/bin/",
-		"usr/share/opensearch/bin",
+		"/opt/acme/bin/",
+		"opt/acme/bin",
 		"",
-		"./usr/share/opensearch/config/",
+		"./opt/acme/config/",
 	})
 	want := []string{
-		"usr/share/opensearch/bin/",
-		"usr/share/opensearch/bin",
-		"usr/share/opensearch/config/",
+		"opt/acme/bin/",
+		"opt/acme/bin",
+		"opt/acme/config/",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("len = %d, want %d: %#v", len(got), len(want), got)
@@ -33,44 +33,44 @@ func TestMatchesPrefetchPattern(t *testing.T) {
 	}{
 		{
 			name:    "exact",
-			path:    "/usr/share/opensearch/jdk/lib/modules",
-			pattern: "usr/share/opensearch/jdk/lib/modules",
+			path:    "/opt/acme/runtime/lib/modules",
+			pattern: "opt/acme/runtime/lib/modules",
 			want:    true,
 		},
 		{
 			name:    "prefix",
-			path:    "usr/share/opensearch/bin/opensearch",
-			pattern: "usr/share/opensearch/bin/",
+			path:    "opt/acme/bin/server",
+			pattern: "opt/acme/bin/",
 			want:    true,
 		},
 		{
 			name:    "suffix",
-			path:    "usr/share/opensearch/lib/opensearch.jar",
+			path:    "opt/acme/lib/app.jar",
 			pattern: "*.jar",
 			want:    true,
 		},
 		{
 			name:    "single segment glob",
-			path:    "usr/share/opensearch/lib/opensearch.jar",
-			pattern: "usr/share/opensearch/lib/*.jar",
+			path:    "opt/acme/lib/app.jar",
+			pattern: "opt/acme/lib/*.jar",
 			want:    true,
 		},
 		{
 			name:    "single segment glob does not cross slash",
-			path:    "usr/share/opensearch/plugins/security/opensearch-security.jar",
-			pattern: "usr/share/opensearch/plugins/*.jar",
+			path:    "opt/acme/plugins/security/security.jar",
+			pattern: "opt/acme/plugins/*.jar",
 			want:    false,
 		},
 		{
 			name:    "module descriptor glob",
-			path:    "usr/share/opensearch/modules/reindex/plugin-descriptor.properties",
-			pattern: "usr/share/opensearch/modules/*/plugin-descriptor.properties",
+			path:    "opt/acme/modules/reindex/plugin-descriptor.properties",
+			pattern: "opt/acme/modules/*/plugin-descriptor.properties",
 			want:    true,
 		},
 		{
 			name:    "prefix miss",
-			path:    "usr/share/opensearch/config/opensearch.yml",
-			pattern: "usr/share/opensearch/bin/",
+			path:    "opt/acme/config/app.yml",
+			pattern: "opt/acme/bin/",
 			want:    false,
 		},
 	}
@@ -84,7 +84,7 @@ func TestMatchesPrefetchPattern(t *testing.T) {
 }
 
 func TestSelectPrefetchSpansForLargeArchiveUsesHeadAndTail(t *testing.T) {
-	got := selectPrefetchSpans("usr/share/opensearch/jdk/lib/modules", 10, 109, 16, 8)
+	got := selectPrefetchSpans("opt/acme/runtime/lib/modules", 10, 109, 16, 8)
 	if len(got) != 16 {
 		t.Fatalf("len = %d, want 16", len(got))
 	}
@@ -100,7 +100,7 @@ func TestSelectPrefetchSpansForLargeArchiveUsesHeadAndTail(t *testing.T) {
 }
 
 func TestSelectPrefetchSpansForArchiveWarmsMiddleAsync(t *testing.T) {
-	got := selectPrefetchSpans("usr/share/opensearch/jdk/lib/modules", 10, 44, 64, 8)
+	got := selectPrefetchSpans("opt/acme/runtime/lib/modules", 10, 44, 64, 8)
 	if len(got) != 35 {
 		t.Fatalf("len = %d, want 35", len(got))
 	}
@@ -122,7 +122,7 @@ func TestSelectPrefetchSpansForArchiveWarmsMiddleAsync(t *testing.T) {
 }
 
 func TestSelectPrefetchSpansForNonArchiveKeepsFirstSyncOnly(t *testing.T) {
-	got := selectPrefetchSpans("usr/share/opensearch/plugins/opensearch-ml/model.bin", 5, 20, 4, 8)
+	got := selectPrefetchSpans("opt/acme/plugins/ml/model.bin", 5, 20, 4, 8)
 	if len(got) != 4 {
 		t.Fatalf("len = %d, want 4", len(got))
 	}
@@ -141,7 +141,7 @@ func TestSelectPrefetchSpansForNonArchiveKeepsFirstSyncOnly(t *testing.T) {
 }
 
 func TestSelectPrefetchSpansUsesArchiveEdgeOption(t *testing.T) {
-	got := selectPrefetchSpans("usr/share/opensearch/jdk/lib/modules", 10, 109, 12, 3)
+	got := selectPrefetchSpans("opt/acme/runtime/lib/modules", 10, 109, 12, 3)
 	if len(got) != 12 {
 		t.Fatalf("len = %d, want 12", len(got))
 	}
@@ -162,7 +162,7 @@ func TestSelectPrefetchSpansUsesArchiveEdgeOption(t *testing.T) {
 }
 
 func TestSelectPrefetchSpansKeepsJarSyncEdgeSmall(t *testing.T) {
-	got := selectPrefetchSpans("usr/share/opensearch/lib/opensearch.jar", 10, 19, 10, 4)
+	got := selectPrefetchSpans("opt/acme/lib/app.jar", 10, 19, 10, 4)
 	if len(got) != 10 {
 		t.Fatalf("len = %d, want 10", len(got))
 	}

@@ -81,6 +81,9 @@ const (
 	// IndexAnnotationHermesPrefetchProfile records the internal prefetch
 	// profile used to generate startup-critical SOCI prefetch artifacts.
 	IndexAnnotationHermesPrefetchProfile = "hermes.cloudpilot.ai/prefetch-profile"
+	// IndexAnnotationHermesPrefetchPaths records the normalized internal startup
+	// path patterns used to build the prefetch artifact.
+	IndexAnnotationHermesPrefetchPaths = "hermes.cloudpilot.ai/prefetch-paths"
 	// IndexAnnotationHermesSkipFileVerification lets the daemon trust the zTOC
 	// file metadata and skip per-file tar header reads on the startup path.
 	IndexAnnotationHermesSkipFileVerification = "hermes.cloudpilot.ai/skip-file-verification"
@@ -1091,7 +1094,7 @@ func prefetchNeedsTail(name string) bool {
 	case ".jar", ".zip", ".jmod", ".jimage", ".jsa":
 		return true
 	}
-	return name == "usr/share/opensearch/jdk/lib/modules"
+	return strings.HasSuffix(name, "/lib/modules")
 }
 
 func prefetchArchiveSyncEdgeSpans(name string, configured int) int {
@@ -1100,6 +1103,17 @@ func prefetchArchiveSyncEdgeSpans(name string, configured int) int {
 		return 1
 	}
 	return configured
+}
+
+func prefetchPathsAnnotation(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	payload, err := json.Marshal(paths)
+	if err != nil {
+		return ""
+	}
+	return string(payload)
 }
 
 func (b *IndexBuilder) addSociLayerAnnotations(layerDesc *ocispec.Descriptor, ztocDesc *ocispec.Descriptor, toc *ztoc.Ztoc) {
@@ -1168,6 +1182,9 @@ func (b *IndexBuilder) storePrefetchLayer(ctx context.Context, layerDigest strin
 	desc.Annotations[IndexAnnotationImageLayerDigest] = layerDigest
 	if profile := b.config.indexAnnotations[IndexAnnotationHermesPrefetchProfile]; profile != "" {
 		desc.Annotations[IndexAnnotationHermesPrefetchProfile] = profile
+	}
+	if paths := prefetchPathsAnnotation(b.config.prefetchPaths); paths != "" {
+		desc.Annotations[IndexAnnotationHermesPrefetchPaths] = paths
 	}
 
 	err = b.blobStore.Push(ctx, desc, reader)

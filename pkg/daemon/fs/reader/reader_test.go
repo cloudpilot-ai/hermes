@@ -15,13 +15,13 @@ func TestIsStartupReadaheadPath(t *testing.T) {
 		path string
 		want bool
 	}{
-		{name: "opensearch core jar", path: "usr/share/opensearch/lib/opensearch-2.19.1.jar", want: true},
-		{name: "module jar", path: "/usr/share/opensearch/modules/transport-netty4/netty-common.jar", want: true},
-		{name: "plugin jar", path: "usr/share/opensearch/plugins/opensearch-security/opensearch-security.jar", want: true},
-		{name: "jdk modules", path: "usr/share/opensearch/jdk/lib/modules", want: true},
-		{name: "jdk shared object", path: "usr/share/opensearch/jdk/lib/libjava.so", want: false},
-		{name: "non opensearch jar", path: "usr/local/lib/helper.jar", want: false},
-		{name: "config file", path: "usr/share/opensearch/config/opensearch.yml", want: false},
+		{name: "app lib jar", path: "opt/acme/lib/acme.jar", want: true},
+		{name: "module jar", path: "/opt/acme/modules/transport/netty-common.jar", want: true},
+		{name: "plugin jar", path: "opt/acme/plugins/security/security.jar", want: true},
+		{name: "runtime modules", path: "opt/acme/runtime/lib/modules", want: true},
+		{name: "shared object", path: "opt/acme/runtime/lib/libvm.so", want: false},
+		{name: "generic lib jar", path: "usr/local/lib/helper.jar", want: true},
+		{name: "config file", path: "opt/acme/config/app.yml", want: false},
 	}
 
 	for _, tt := range tests {
@@ -41,17 +41,17 @@ func TestReaderMaterializedPathRequiresCleanRelativeTarName(t *testing.T) {
 	}
 	gr := &reader{
 		materializedFiles: map[string]string{
-			"usr/share/opensearch/lib/opensearch.jar": localPath,
+			"opt/acme/lib/app.jar": localPath,
 		},
 	}
-	got, ok := gr.materializedPath("usr/share/opensearch/lib/opensearch.jar")
+	got, ok := gr.materializedPath("opt/acme/lib/app.jar")
 	if !ok {
 		t.Fatalf("materialized path was not found")
 	}
 	if got != localPath {
 		t.Fatalf("materialized path = %q, want %q", got, localPath)
 	}
-	if _, ok := gr.materializedPath("/../usr/share/opensearch/lib/opensearch.jar"); ok {
+	if _, ok := gr.materializedPath("/../opt/acme/lib/app.jar"); ok {
 		t.Fatalf("malformed tar name resolved to a materialized file")
 	}
 }
@@ -63,9 +63,9 @@ func TestOpenFileUsesMaterializedOnlyWhenVerificationDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	gr := &reader{
-		r: fakeMetadataReader{file: fakeMetadataFile{name: "usr/share/opensearch/lib/opensearch.jar"}},
+		r: fakeMetadataReader{file: fakeMetadataFile{name: "opt/acme/lib/app.jar"}},
 		materializedFiles: map[string]string{
-			"usr/share/opensearch/lib/opensearch.jar": localPath,
+			"opt/acme/lib/app.jar": localPath,
 		},
 	}
 
