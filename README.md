@@ -101,6 +101,10 @@ The Hermes number measures Pod startup after the SOCI artifact is ready. See
 the [full EC2 + kind report](docs/reports/ec2-kind-full-suite-2026-05-27.md)
 for details.
 
+For EKS scheduled-to-first-HTTP-200 results across OpenSearch, Solr, and Spark,
+see the
+[full EKS end-to-end benchmark](https://www.cloudpilot.ai/en/blog/hermes-eks-http-200-acceleration/).
+
 ## Components
 
 - `HermesPolicy`: Cluster-scoped CRD that selects Pod image references with
