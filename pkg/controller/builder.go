@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	sociapi "github.com/cloudpilot-ai/hermes/pkg/common/soci"
 	socistore "github.com/cloudpilot-ai/hermes/pkg/common/soci/store"
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/reference"
@@ -67,7 +69,7 @@ func (b *Builder) Enqueue(task BuildTask) bool {
 	if task.Platform == "" {
 		task.Platform = b.cfg.Platform
 	}
-	key := taskKey(task.SourceImageRef, task.Platform)
+	key := taskKey(task.SourceImageRef, task.Platform, task.Acceleration.Key())
 	b.rememberRawPolicies(key, task.PolicyNames)
 	if !b.seen.Add(key) {
 		return true
@@ -89,7 +91,7 @@ func (b *Builder) worker(ctx context.Context, id int) {
 		case <-ctx.Done():
 			return
 		case task := <-b.queue:
-			key := taskKey(task.SourceImageRef, task.Platform)
+			key := taskKey(task.SourceImageRef, task.Platform, task.Acceleration.Key())
 			task.PolicyNames = b.policyNamesForRawKey(key, task.PolicyNames)
 			err := b.Build(ctx, task)
 			b.forgetRawPolicies(key)
@@ -105,11 +107,12 @@ func (b *Builder) Build(ctx context.Context, task BuildTask) error {
 	if task.Platform == "" {
 		task.Platform = b.cfg.Platform
 	}
+	accelerationKey := task.Acceleration.Key()
 	buildCtx, cancel := context.WithTimeout(ctx, b.cfg.BuildTimeout)
 	defer cancel()
 
 	if imageDigestRef, ok := canonicalDigestRef(task.SourceImageRef); ok {
-		ready, err := b.store.HasReady(ctx, imageDigestRef, task.Platform)
+		ready, err := b.store.HasReady(ctx, imageDigestRef, task.Platform, accelerationKey)
 		if err != nil {
 			return err
 		}
@@ -131,24 +134,26 @@ func (b *Builder) Build(ctx context.Context, task BuildTask) error {
 	if b.cfg.PullImage {
 		img, err = b.pullImage(buildCtx, client, task.SourceImageRef, task.Platform, task.RegistryAuths)
 		if err != nil {
-			_ = b.store.MarkFailed(ctx, task.SourceImageRef, task.SourceImageRef, task.Platform, err)
+			_ = b.store.MarkFailed(ctx, task.SourceImageRef, task.SourceImageRef, task.Platform, accelerationKey, err)
 			return err
 		}
 	} else {
 		img, err = client.GetImage(buildCtx, task.SourceImageRef)
 		if err != nil {
-			_ = b.store.MarkFailed(ctx, task.SourceImageRef, task.SourceImageRef, task.Platform, err)
+			_ = b.store.MarkFailed(ctx, task.SourceImageRef, task.SourceImageRef, task.Platform, accelerationKey, err)
 			return err
 		}
 	}
 
-	imageDigestRef, manifestDigest, configDigest, err := b.resolveImage(buildCtx, client, img, task.SourceImageRef, task.Platform)
+	imageDigestRef, manifestDigest, configDigest, imageConfig, err := b.resolveImage(buildCtx, client, img, task.SourceImageRef, task.Platform)
 	if err != nil {
-		_ = b.store.MarkFailed(ctx, task.SourceImageRef, task.SourceImageRef, task.Platform, err)
+		_ = b.store.MarkFailed(ctx, task.SourceImageRef, task.SourceImageRef, task.Platform, accelerationKey, err)
 		return err
 	}
+	task.Acceleration = task.Acceleration.WithImageConfig(imageConfig.Config)
+	buildConfig := b.effectiveBuildConfig(task)
 
-	ready, err := b.store.HasReady(ctx, imageDigestRef, task.Platform)
+	ready, err := b.store.HasReady(ctx, imageDigestRef, task.Platform, accelerationKey)
 	if err != nil {
 		return err
 	}
@@ -159,8 +164,8 @@ func (b *Builder) Build(ctx context.Context, task BuildTask) error {
 		return nil
 	}
 
-	buildKey := imageDigestRef + "|" + task.Platform
-	task.PolicyNames = b.rememberDigestPolicies(buildKey, b.policyNamesForRawKey(taskKey(task.SourceImageRef, task.Platform), task.PolicyNames))
+	buildKey := taskKey(imageDigestRef, task.Platform, accelerationKey)
+	task.PolicyNames = b.rememberDigestPolicies(buildKey, b.policyNamesForRawKey(taskKey(task.SourceImageRef, task.Platform, accelerationKey), task.PolicyNames))
 	if !b.building.Add(buildKey) {
 		log.Printf("skip in-flight index build image=%s source=%s platform=%s reason=%s", imageDigestRef, task.SourceImageRef, task.Platform, task.Reason)
 		return nil
@@ -168,7 +173,7 @@ func (b *Builder) Build(ctx context.Context, task BuildTask) error {
 	defer b.building.Delete(buildKey)
 	defer b.forgetDigestPolicies(buildKey)
 
-	marked, err := b.store.MarkBuilding(ctx, task, imageDigestRef, manifestDigest, b.cfg)
+	marked, err := b.store.MarkBuilding(ctx, task, imageDigestRef, manifestDigest, buildConfig, accelerationKey)
 	if err != nil {
 		return err
 	}
@@ -180,16 +185,16 @@ func (b *Builder) Build(ctx context.Context, task BuildTask) error {
 	}
 	b.recordPolicyBuild(ctx, task, imageDigestRef, task.Platform, hermesv1.HermesImagePhaseBuilding, nil)
 
-	indexDesc, err := b.buildIndex(buildCtx, client, img, task.Platform)
+	indexDesc, err := b.buildIndex(buildCtx, client, img, task, buildConfig)
 	if err != nil {
-		_ = b.store.MarkFailed(ctx, task.SourceImageRef, imageDigestRef, task.Platform, err)
+		_ = b.store.MarkFailed(ctx, task.SourceImageRef, imageDigestRef, task.Platform, accelerationKey, err)
 		b.recordPolicyBuild(ctx, task, imageDigestRef, task.Platform, hermesv1.HermesImagePhaseFailed, err)
 		return err
 	}
 
 	indexDesc, indexBytes, ztocs, ztocBytes, layers, err := b.readIndexArtifacts(buildCtx, indexDesc)
 	if err != nil {
-		_ = b.store.MarkFailed(ctx, task.SourceImageRef, imageDigestRef, task.Platform, err)
+		_ = b.store.MarkFailed(ctx, task.SourceImageRef, imageDigestRef, task.Platform, accelerationKey, err)
 		b.recordPolicyBuild(ctx, task, imageDigestRef, task.Platform, hermesv1.HermesImagePhaseFailed, err)
 		return err
 	}
@@ -201,7 +206,7 @@ func (b *Builder) Build(ctx context.Context, task BuildTask) error {
 		ImageConfigDigest:   configDigest,
 		Platform:            task.Platform,
 	}
-	if err := b.store.PutReady(ctx, artifact, indexDesc, indexBytes, ztocs, ztocBytes, layers, b.cfg); err != nil {
+	if err := b.store.PutReady(ctx, artifact, indexDesc, indexBytes, ztocs, ztocBytes, layers, buildConfig, accelerationKey); err != nil {
 		b.recordPolicyBuild(ctx, task, imageDigestRef, task.Platform, hermesv1.HermesImagePhaseFailed, err)
 		return err
 	}
@@ -247,8 +252,12 @@ func (b *Builder) recordPolicyBuild(ctx context.Context, task BuildTask, imageDi
 	recorder.RecordBuild(ctx, policyNames, imageDigestRef, platform, phase, buildErr)
 }
 
-func taskKey(imageRef, platform string) string {
-	return imageRef + "|" + platform
+func taskKey(imageRef, platform string, accelerationKeys ...string) string {
+	key := imageRef + "|" + platform
+	if len(accelerationKeys) > 0 && accelerationKeys[0] != "" {
+		key += "|" + accelerationKeys[0]
+	}
+	return key
 }
 
 func (b *Builder) rememberRawPolicies(key string, policyNames []string) []string {
@@ -287,8 +296,9 @@ func (b *Builder) policyNamesForRawKey(key string, policyNames []string) []strin
 }
 
 func (b *Builder) policyNamesForStatus(task BuildTask, imageDigestRef, platform string) []string {
-	rawKey := taskKey(task.SourceImageRef, platform)
-	digestKey := taskKey(imageDigestRef, platform)
+	accelerationKey := task.Acceleration.Key()
+	rawKey := taskKey(task.SourceImageRef, platform, accelerationKey)
+	digestKey := taskKey(imageDigestRef, platform, accelerationKey)
 	b.policyMu.Lock()
 	defer b.policyMu.Unlock()
 	names := append([]string(nil), task.PolicyNames...)
@@ -324,28 +334,41 @@ func (b *Builder) pullImage(ctx context.Context, client *containerd.Client, imag
 	return img, nil
 }
 
-func (b *Builder) resolveImage(ctx context.Context, client *containerd.Client, img containerd.Image, imageRef, platform string) (imageDigestRef, manifestDigest, configDigest string, err error) {
+func (b *Builder) resolveImage(ctx context.Context, client *containerd.Client, img containerd.Image, imageRef, platform string) (imageDigestRef, manifestDigest, configDigest string, imageConfig ocispec.Image, err error) {
 	plat, err := platforms.Parse(platform)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", ocispec.Image{}, err
 	}
 	matcher := platforms.OnlyStrict(plat)
 	manifestDesc, err := sociapi.GetImageManifestDescriptor(ctx, client.ContentStore(), img.Target(), matcher)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", ocispec.Image{}, err
 	}
 	manifest, err := images.Manifest(ctx, client.ContentStore(), img.Target(), matcher)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", ocispec.Image{}, err
+	}
+	configBytes, err := content.ReadBlob(ctx, client.ContentStore(), manifest.Config)
+	if err != nil {
+		return "", "", "", ocispec.Image{}, err
+	}
+	if err := json.Unmarshal(configBytes, &imageConfig); err != nil {
+		return "", "", "", ocispec.Image{}, err
 	}
 	refspec, err := reference.Parse(imageRef)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", ocispec.Image{}, err
 	}
-	return fmt.Sprintf("%s@%s", refspec.Locator, manifestDesc.Digest.String()), manifestDesc.Digest.String(), manifest.Config.Digest.String(), nil
+	return fmt.Sprintf("%s@%s", refspec.Locator, manifestDesc.Digest.String()), manifestDesc.Digest.String(), manifest.Config.Digest.String(), imageConfig, nil
 }
 
-func (b *Builder) buildIndex(ctx context.Context, client *containerd.Client, img containerd.Image, platform string) (ocispec.Descriptor, error) {
+func (b *Builder) effectiveBuildConfig(task BuildTask) Config {
+	cfg := b.cfg
+	cfg.MinLayerSize = task.Acceleration.MinLayerSize(cfg.MinLayerSize)
+	return cfg
+}
+
+func (b *Builder) buildIndex(ctx context.Context, client *containerd.Client, img containerd.Image, task BuildTask, cfg Config) (ocispec.Descriptor, error) {
 	optimizations, err := parseOptimizations(b.cfg.Optimizations)
 	if err != nil {
 		return ocispec.Descriptor{}, err
@@ -364,26 +387,31 @@ func (b *Builder) buildIndex(ctx context.Context, client *containerd.Client, img
 	builder, err := sociapi.NewIndexBuilder(
 		client.ContentStore(),
 		blobStore,
-		sociapi.WithMinLayerSize(b.cfg.MinLayerSize),
-		sociapi.WithSpanSize(b.cfg.SpanSize),
+		sociapi.WithMinLayerSize(cfg.MinLayerSize),
+		sociapi.WithSpanSize(cfg.SpanSize),
 		sociapi.WithBuildToolIdentifier(buildToolIdentifier),
 		sociapi.WithOptimizations(optimizations),
 		sociapi.WithArtifactsDb(artifactsDb),
+		sociapi.WithIndexAnnotations(task.Acceleration.IndexAnnotations()),
+		sociapi.WithPrefetchPaths(task.Acceleration.PrefetchPaths()),
+		sociapi.WithPrefetchMaxSpans(task.Acceleration.PrefetchMaxSpans()),
+		sociapi.WithPrefetchMaxSpansPerFile(task.Acceleration.prefetchMaxSpansPerFile()),
+		sociapi.WithPrefetchArchiveEdgeSpans(task.Acceleration.prefetchArchiveEdges()),
 	)
 	if err != nil {
 		return ocispec.Descriptor{}, err
 	}
-	plat, err := platforms.Parse(platform)
+	plat, err := platforms.Parse(task.Platform)
 	if err != nil {
 		return ocispec.Descriptor{}, err
 	}
 	start := time.Now()
-	log.Printf("building index in-process image=%s platform=%s span=%d minLayer=%d", img.Name(), platform, b.cfg.SpanSize, b.cfg.MinLayerSize)
+	log.Printf("building index in-process image=%s platform=%s span=%d minLayer=%d prefetchProfile=%s prefetchMaxSpans=%d", img.Name(), task.Platform, cfg.SpanSize, cfg.MinLayerSize, task.Acceleration.PrefetchProfile(), task.Acceleration.PrefetchMaxSpans())
 	indexWithMetadata, err := builder.Build(ctx, img.Metadata(), sociapi.WithPlatform(plat), sociapi.WithNoGarbageCollectionLabel())
 	if err != nil {
 		return ocispec.Descriptor{}, err
 	}
-	log.Printf("built index in-process image=%s platform=%s index=%s elapsed=%s", img.Name(), platform, indexWithMetadata.Desc.Digest, time.Since(start).Round(time.Millisecond))
+	log.Printf("built index in-process image=%s platform=%s index=%s elapsed=%s", img.Name(), task.Platform, indexWithMetadata.Desc.Digest, time.Since(start).Round(time.Millisecond))
 	return indexWithMetadata.Desc, nil
 }
 

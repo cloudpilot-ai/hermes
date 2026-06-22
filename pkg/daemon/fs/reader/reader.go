@@ -43,6 +43,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	pathpkg "path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,8 +57,23 @@ import (
 	commonmetrics "github.com/cloudpilot-ai/hermes/pkg/daemon/fs/metrics/common"
 	spanmanager "github.com/cloudpilot-ai/hermes/pkg/daemon/fs/spanmanager"
 	"github.com/cloudpilot-ai/hermes/pkg/daemon/metadata"
+	"github.com/containerd/log"
 	digest "github.com/opencontainers/go-digest"
+	"github.com/sirupsen/logrus"
 )
+
+const (
+	startupReadaheadMaxSpans    = 32
+	startupReadaheadConcurrency = 2
+	startupReadaheadWindowSize  = compression.Offset(16 << 20)
+)
+
+var startupReadTraceEnabled = os.Getenv("HERMES_TRACE_STARTUP_READS") != ""
+
+type MaterializedFileSet struct {
+	Root  string
+	Files map[string]string
+}
 
 type Reader interface {
 	OpenFile(id uint32) (io.ReaderAt, error)
@@ -64,14 +82,36 @@ type Reader interface {
 	LastOnDemandReadTime() time.Time
 }
 
+type LocalFileReaderAt interface {
+	io.ReaderAt
+	LocalPath() string
+}
+
 // NewReader creates a Reader based on the given soci blob and Span Manager.
-func NewReader(r metadata.Reader, layerSha digest.Digest, spanManager *spanmanager.SpanManager, disableVerification bool) (Reader, error) {
-	return &reader{
+func NewReader(r metadata.Reader, layerSha digest.Digest, spanManager *spanmanager.SpanManager, disableVerification bool, enableStartupReadahead ...bool) (Reader, error) {
+	var startupReadahead bool
+	if len(enableStartupReadahead) > 0 {
+		startupReadahead = enableStartupReadahead[0]
+	}
+	return NewReaderWithMaterializedFiles(r, layerSha, spanManager, disableVerification, nil, startupReadahead)
+}
+
+func NewReaderWithMaterializedFiles(r metadata.Reader, layerSha digest.Digest, spanManager *spanmanager.SpanManager, disableVerification bool, materialized *MaterializedFileSet, enableStartupReadahead bool) (Reader, error) {
+	gr := &reader{
 		spanManager:         spanManager,
 		r:                   r,
 		layerSha:            layerSha,
 		disableVerification: disableVerification,
-	}, nil
+	}
+	if materialized != nil {
+		gr.materializedRoot = materialized.Root
+		gr.materializedFiles = materialized.Files
+	}
+	if enableStartupReadahead {
+		gr.startupReadahead = true
+		gr.readaheadSem = make(chan struct{}, startupReadaheadConcurrency)
+	}
+	return gr, nil
 }
 
 type reader struct {
@@ -86,6 +126,18 @@ type reader struct {
 	closedMu sync.Mutex
 
 	disableVerification bool
+	startupReadahead    bool
+	readaheadSem        chan struct{}
+	readaheadFiles      sync.Map
+	readaheadWG         sync.WaitGroup
+	openFileCache       sync.Map
+	materializedRoot    string
+	materializedFiles   map[string]string
+}
+
+type startupReadaheadKey struct {
+	id     uint32
+	window uint64
 }
 
 func (gr *reader) Metadata() metadata.Reader {
@@ -109,10 +161,14 @@ func (gr *reader) OpenFile(id uint32) (io.ReaderAt, error) {
 	if gr.isClosed() {
 		return nil, fmt.Errorf("reader is already closed")
 	}
-	var fr metadata.File
-	fr, err := gr.r.OpenFile(id)
+	fr, err := gr.openMetadataFile(id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file %d: %w", id, err)
+	}
+	if gr.disableVerification {
+		if path, ok := gr.materializedPath(fr.TarName()); ok {
+			return &materializedFile{path: path}, nil
+		}
 	}
 	return &file{
 		id: id,
@@ -121,18 +177,68 @@ func (gr *reader) OpenFile(id uint32) (io.ReaderAt, error) {
 	}, nil
 }
 
+func (gr *reader) materializedPath(name string) (string, bool) {
+	if len(gr.materializedFiles) == 0 {
+		return "", false
+	}
+	key, ok := MaterializedFileKey(name)
+	if !ok {
+		return "", false
+	}
+	path, ok := gr.materializedFiles[key]
+	if !ok || path == "" {
+		return "", false
+	}
+	if _, err := os.Stat(path); err == nil {
+		return path, true
+	}
+	return "", false
+}
+
+func MaterializedFileKey(name string) (string, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.HasPrefix(name, "/") {
+		return "", false
+	}
+	clean := pathpkg.Clean(name)
+	if clean == "." || clean != name || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", false
+	}
+	return clean, true
+}
+
+func (gr *reader) openMetadataFile(id uint32) (metadata.File, error) {
+	if cached, ok := gr.openFileCache.Load(id); ok {
+		return cached.(metadata.File), nil
+	}
+	fr, err := gr.r.OpenFile(id)
+	if err != nil {
+		return nil, err
+	}
+	cached, _ := gr.openFileCache.LoadOrStore(id, fr)
+	return cached.(metadata.File), nil
+}
+
 func (gr *reader) Close() (retErr error) {
 	gr.closedMu.Lock()
-	defer gr.closedMu.Unlock()
 	if gr.closed {
+		gr.closedMu.Unlock()
 		return nil
 	}
 	gr.closed = true
+	gr.closedMu.Unlock()
+
+	gr.readaheadWG.Wait()
 	if gr.spanManager != nil {
 		gr.spanManager.Close()
 	}
 	if err := gr.r.Close(); err != nil {
 		retErr = errors.Join(retErr, err)
+	}
+	if gr.materializedRoot != "" {
+		if err := os.RemoveAll(gr.materializedRoot); err != nil {
+			retErr = errors.Join(retErr, err)
+		}
 	}
 	return
 }
@@ -142,6 +248,23 @@ func (gr *reader) isClosed() bool {
 	closed := gr.closed
 	gr.closedMu.Unlock()
 	return closed
+}
+
+type materializedFile struct {
+	path string
+}
+
+func (mf *materializedFile) LocalPath() string {
+	return mf.path
+}
+
+func (mf *materializedFile) ReadAt(p []byte, offset int64) (int, error) {
+	f, err := os.Open(mf.path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return f.ReadAt(p, offset)
 }
 
 type file struct {
@@ -172,8 +295,10 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 	}
 	fileOffsetStart := sf.fr.GetUncompressedOffset() + compression.Offset(offset)
 	fileOffsetEnd := fileOffsetStart + expectedSize
+	readStart := time.Now()
 	r, err := sf.gr.spanManager.GetContents(fileOffsetStart, fileOffsetEnd)
 	if err != nil {
+		traceStartupRead(sf, offset, expectedSize, time.Since(readStart), err)
 		return 0, fmt.Errorf("failed to read the file: %w", err)
 	}
 	defer r.Close()
@@ -184,12 +309,145 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 
 	n, err := io.ReadFull(r, p[0:expectedSize])
 	if err != nil {
+		traceStartupRead(sf, offset, expectedSize, time.Since(readStart), err)
 		return 0, fmt.Errorf("unexpected copied data size for on-demand fetch. read = %d, expected = %d: %w", n, expectedSize, err)
 	}
 
 	commonmetrics.AddBytesCount(commonmetrics.SynchronousBytesServed, sf.gr.layerSha, int64(n)) // measure the number of bytes served synchronously
+	traceStartupRead(sf, offset, expectedSize, time.Since(readStart), nil)
+	sf.gr.queueStartupReadahead(sf.id, sf.fr, fileOffsetStart)
 
 	return n, nil
+}
+
+func traceStartupRead(sf *file, offset int64, size compression.Offset, duration time.Duration, err error) {
+	if !startupReadTraceEnabled {
+		return
+	}
+	if err == nil && duration < 2*time.Millisecond && !IsStartupHotPath(sf.fr.TarName()) {
+		return
+	}
+	fields := logrus.Fields{
+		"file_id":     sf.id,
+		"path":        sf.fr.TarName(),
+		"offset":      offset,
+		"size":        int64(size),
+		"duration_ms": float64(duration.Microseconds()) / 1000,
+	}
+	if err != nil {
+		log.L.WithError(err).WithFields(fields).Info("hermes startup read failed")
+		return
+	}
+	log.L.WithFields(fields).Info("hermes startup read")
+}
+
+func (gr *reader) queueStartupReadahead(id uint32, fr metadata.File, readStart compression.Offset) {
+	if !gr.startupReadahead || gr.spanManager == nil || gr.readaheadSem == nil {
+		return
+	}
+	if !IsStartupHotPath(fr.TarName()) {
+		return
+	}
+	fileStart := fr.GetUncompressedOffset()
+	fileEnd := fileStart + fr.GetUncompressedFileSize()
+	if fileEnd <= fileStart {
+		return
+	}
+	start := readStart
+	if start < fileStart || start >= fileEnd {
+		start = fileStart
+	}
+	window := uint64((start - fileStart) / startupReadaheadWindowSize)
+	key := startupReadaheadKey{id: id, window: window}
+	if _, loaded := gr.readaheadFiles.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	if !gr.tryStartStartupReadahead() {
+		gr.readaheadFiles.Delete(key)
+		traceStartupReadahead(fr, start, fileEnd, window, 0, "skipped", nil)
+		return
+	}
+	traceStartupReadahead(fr, start, fileEnd, window, 0, "queued", nil)
+
+	go func() {
+		defer gr.readaheadWG.Done()
+		defer func() { <-gr.readaheadSem }()
+		startedAt := time.Now()
+		err := gr.spanManager.ResolveSpanRange(start, fileEnd, startupReadaheadMaxSpans)
+		traceStartupReadahead(fr, start, fileEnd, window, time.Since(startedAt), "done", err)
+	}()
+}
+
+func traceStartupReadahead(fr metadata.File, start, end compression.Offset, window uint64, duration time.Duration, status string, err error) {
+	if !startupReadTraceEnabled {
+		return
+	}
+	fields := logrus.Fields{
+		"path":        fr.TarName(),
+		"start":       int64(start),
+		"end":         int64(end),
+		"window":      window,
+		"max_spans":   startupReadaheadMaxSpans,
+		"status":      status,
+		"duration_ms": float64(duration.Microseconds()) / 1000,
+	}
+	if err != nil {
+		log.L.WithError(err).WithFields(fields).Info("hermes startup readahead")
+		return
+	}
+	log.L.WithFields(fields).Info("hermes startup readahead")
+}
+
+func (gr *reader) tryStartStartupReadahead() bool {
+	gr.closedMu.Lock()
+	defer gr.closedMu.Unlock()
+	if gr.closed || gr.readaheadSem == nil {
+		return false
+	}
+	select {
+	case gr.readaheadSem <- struct{}{}:
+		gr.readaheadWG.Add(1)
+		return true
+	default:
+		return false
+	}
+}
+
+func IsStartupHotPath(name string) bool {
+	name = normalizedTarPath(name)
+	if name == "." || name == "" {
+		return false
+	}
+	return isRuntimeBundlePath(name) || isStartupArchivePath(name)
+}
+
+func isStartupArchivePath(name string) bool {
+	switch pathpkg.Ext(name) {
+	case ".jar", ".zip", ".jmod", ".jimage", ".jsa":
+		return hasStartupArchiveSegment(name)
+	default:
+		return false
+	}
+}
+
+func isRuntimeBundlePath(name string) bool {
+	return strings.HasSuffix(name, "/lib/modules") ||
+		strings.HasSuffix(name, "/lib/tzdb.dat") ||
+		strings.Contains(name, "/lib/security/")
+}
+
+func hasStartupArchiveSegment(name string) bool {
+	for _, segment := range strings.Split(name, "/") {
+		switch segment {
+		case "lib", "modules", "plugins", "extensions":
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedTarPath(name string) string {
+	return strings.TrimLeft(pathpkg.Clean(strings.TrimSpace(name)), "/")
 }
 
 // Verify verifies that the file's attributes match the tar header in the image layer

@@ -50,9 +50,13 @@ func StartPodWatcher(ctx context.Context, cfg Config, builder *Builder) error {
 				enqueuePodImages(ctx, client, builder, policyManager, pod, cfg.Platform, "pod-add")
 			}
 		},
-		UpdateFunc: func(_, newObj any) {
+		UpdateFunc: func(oldObj, newObj any) {
+			oldPod, oldOK := oldObj.(*corev1.Pod)
 			pod, ok := newObj.(*corev1.Pod)
 			if ok {
+				if oldOK && !podImageInputsChanged(oldPod, pod) {
+					return
+				}
 				enqueuePodImages(ctx, client, builder, policyManager, pod, cfg.Platform, "pod-update")
 			}
 		},
@@ -102,8 +106,43 @@ func enqueueImage(builder *Builder, policies *HermesPolicyManager, image, defaul
 			Reason:         reason,
 			PolicyNames:    target.PolicyNames,
 			RegistryAuths:  auths,
+			Acceleration:   target.Acceleration,
 		})
 	}
+}
+
+func podImageInputsChanged(oldPod, newPod *corev1.Pod) bool {
+	oldInputs := podImageInputs(oldPod)
+	newInputs := podImageInputs(newPod)
+	if len(oldInputs) != len(newInputs) {
+		return true
+	}
+	for i := range oldInputs {
+		if oldInputs[i] != newInputs[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func podImageInputs(pod *corev1.Pod) []string {
+	if pod == nil {
+		return nil
+	}
+	inputs := make([]string, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers)+len(pod.Spec.EphemeralContainers)+len(pod.Spec.ImagePullSecrets))
+	for _, c := range pod.Spec.InitContainers {
+		inputs = append(inputs, "init:"+c.Name+"="+c.Image)
+	}
+	for _, c := range pod.Spec.Containers {
+		inputs = append(inputs, "container:"+c.Name+"="+c.Image)
+	}
+	for _, c := range pod.Spec.EphemeralContainers {
+		inputs = append(inputs, "ephemeral:"+c.Name+"="+c.Image)
+	}
+	for _, s := range pod.Spec.ImagePullSecrets {
+		inputs = append(inputs, "secret:"+s.Name)
+	}
+	return inputs
 }
 
 func enqueuePodsFromStore(ctx context.Context, client kubernetes.Interface, builder *Builder, policies *HermesPolicyManager, store cache.Store, platform, reason string) {

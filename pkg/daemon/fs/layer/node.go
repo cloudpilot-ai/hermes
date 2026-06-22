@@ -255,6 +255,28 @@ func (fs *fs) logAndIncrementOpCounter(ctx context.Context, operationName string
 	}
 }
 
+func (fs *fs) incrementOpCounter(operationName string) {
+	if fs.operationCounter != nil {
+		fs.operationCounter.Inc(operationName)
+	}
+}
+
+func (n *node) logAndIncrementOpCounter(ctx context.Context, operationName string) {
+	if n.fs.logFSOperations {
+		n.fs.logAndIncrementOpCounter(ctx, operationName, n.Path(nil))
+		return
+	}
+	n.fs.incrementOpCounter(operationName)
+}
+
+func (w *whiteout) logAndIncrementOpCounter(ctx context.Context, operationName string) {
+	if w.fs.logFSOperations {
+		w.fs.logAndIncrementOpCounter(ctx, operationName, w.Path(nil))
+		return
+	}
+	w.fs.incrementOpCounter(operationName)
+}
+
 // reportFailure handles telemetry operations pertaining to FUSE failures
 // as well as writing an error to the state file.
 func (fs *fs) reportFailure(operationName string, stateError error) {
@@ -303,7 +325,7 @@ var _ = (fusefs.InodeEmbedder)((*node)(nil))
 var _ = (fusefs.NodeReaddirer)((*node)(nil))
 
 func (n *node) Readdir(ctx context.Context) (fusefs.DirStream, syscall.Errno) {
-	n.fs.logAndIncrementOpCounter(ctx, fuseOpReaddir, n.Path(nil))
+	n.logAndIncrementOpCounter(ctx, fuseOpReaddir)
 
 	ents, errno := n.readdir()
 	if errno != 0 {
@@ -390,7 +412,7 @@ func (n *node) readdir() ([]fuse.DirEntry, syscall.Errno) {
 var _ = (fusefs.NodeLookuper)((*node)(nil))
 
 func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fusefs.Inode, syscall.Errno) {
-	n.fs.logAndIncrementOpCounter(ctx, fuseOpLookup, n.Path(nil))
+	n.logAndIncrementOpCounter(ctx, fuseOpLookup)
 
 	isRoot := n.isRootNode()
 
@@ -479,12 +501,19 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fu
 var _ = (fusefs.NodeOpener)((*node)(nil))
 
 func (n *node) Open(ctx context.Context, flags uint32) (fh fusefs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
-	n.fs.logAndIncrementOpCounter(ctx, fuseOpOpen, n.Path(nil))
+	n.logAndIncrementOpCounter(ctx, fuseOpOpen)
 
 	ra, err := n.fs.r.OpenFile(n.id)
 	if err != nil {
 		n.fs.reportFailure(fuseOpOpen, fmt.Errorf("%s: %w", fuseOpOpen, err))
 		return nil, 0, syscall.EIO
+	}
+	if local, ok := ra.(reader.LocalFileReaderAt); ok {
+		fd, err := syscall.Open(local.LocalPath(), syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
+		if err == nil {
+			return fusefs.NewLoopbackFile(fd), fuse.FOPEN_KEEP_CACHE, 0
+		}
+		log.G(ctx).WithError(err).WithField("path", local.LocalPath()).Debug("failed to open materialized local file; falling back to reader path")
 	}
 	return &file{
 		n:  n,
@@ -495,7 +524,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (fh fusefs.FileHandle, fu
 var _ = (fusefs.NodeGetattrer)((*node)(nil))
 
 func (n *node) Getattr(ctx context.Context, f fusefs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	n.fs.logAndIncrementOpCounter(ctx, fuseOpGetattr, n.Path(nil))
+	n.logAndIncrementOpCounter(ctx, fuseOpGetattr)
 
 	ino, err := n.fs.inodeOfID(n.id)
 	if err != nil {
@@ -509,7 +538,7 @@ func (n *node) Getattr(ctx context.Context, f fusefs.FileHandle, out *fuse.AttrO
 var _ = (fusefs.NodeGetxattrer)((*node)(nil))
 
 func (n *node) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
-	n.fs.logAndIncrementOpCounter(ctx, fuseOpGetxattr, n.Path(nil))
+	n.logAndIncrementOpCounter(ctx, fuseOpGetxattr)
 
 	ent := n.attr
 	opq := n.isOpaque()
@@ -534,7 +563,7 @@ func (n *node) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, 
 var _ = (fusefs.NodeListxattrer)((*node)(nil))
 
 func (n *node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
-	n.fs.logAndIncrementOpCounter(ctx, fuseOpListxattr, n.Path(nil))
+	n.logAndIncrementOpCounter(ctx, fuseOpListxattr)
 
 	ent := n.attr
 	opq := n.isOpaque()
@@ -557,7 +586,7 @@ func (n *node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errn
 var _ = (fusefs.NodeReadlinker)((*node)(nil))
 
 func (n *node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
-	n.fs.logAndIncrementOpCounter(ctx, fuseOpReadLink, n.Path(nil))
+	n.logAndIncrementOpCounter(ctx, fuseOpReadLink)
 
 	ent := n.attr
 	return []byte(ent.LinkName), 0
@@ -579,7 +608,7 @@ type file struct {
 var _ = (fusefs.FileReader)((*file)(nil))
 
 func (f *file) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	f.n.fs.logAndIncrementOpCounter(ctx, fuseOpFileRead, f.n.Path(nil))
+	f.n.logAndIncrementOpCounter(ctx, fuseOpFileRead)
 
 	defer commonmetrics.MeasureLatencyInMicroseconds(commonmetrics.SynchronousRead, f.n.fs.layerDigest, time.Now()) // measure time for synchronous file reads (in microseconds)
 	defer commonmetrics.IncOperationCount(commonmetrics.SynchronousReadCount, f.n.fs.layerDigest)                   // increment the counter for synchronous file reads
@@ -594,7 +623,7 @@ func (f *file) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResul
 var _ = (fusefs.FileGetattrer)((*file)(nil))
 
 func (f *file) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno {
-	f.n.fs.logAndIncrementOpCounter(ctx, fuseOpFileGetattr, f.n.Path(nil))
+	f.n.logAndIncrementOpCounter(ctx, fuseOpFileGetattr)
 
 	ino, err := f.n.fs.inodeOfID(f.n.id)
 	if err != nil {
@@ -616,7 +645,7 @@ type whiteout struct {
 var _ = (fusefs.NodeGetattrer)((*whiteout)(nil))
 
 func (w *whiteout) Getattr(ctx context.Context, f fusefs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	w.fs.logAndIncrementOpCounter(ctx, fuseOpWhiteoutGetattr, w.Path(nil))
+	w.logAndIncrementOpCounter(ctx, fuseOpWhiteoutGetattr)
 
 	ino, err := w.fs.inodeOfID(w.id)
 	if err != nil {

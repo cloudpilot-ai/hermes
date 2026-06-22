@@ -37,6 +37,12 @@ type BuildTask struct {
 	Reason         string
 	PolicyNames    []string
 	RegistryAuths  []RegistryAuth
+	Acceleration   BuildAcceleration
+}
+
+type BuildAcceleration struct {
+	Profile              string
+	PrefetchPathPatterns []string
 }
 
 type RegistryAuth struct {
@@ -52,6 +58,7 @@ type Artifact struct {
 	ImageManifestDigest string `json:"imageManifestDigest"`
 	ImageConfigDigest   string `json:"imageConfigDigest"`
 	Platform            string `json:"platform"`
+	AccelerationKey     string `json:"accelerationKey"`
 	IndexDigest         string `json:"indexDigest"`
 	IndexMediaType      string `json:"indexMediaType"`
 	IndexSize           int64  `json:"indexSize"`

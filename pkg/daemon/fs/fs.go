@@ -54,6 +54,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -369,9 +370,17 @@ type sociContext struct {
 	fuseOperationCounter *layer.FuseOperationCounter
 }
 
-func (c *sociContext) Init(ctx context.Context, fs *filesystem, imageRef, indexDigest, imageManifestDigest string, client *http.Client) error {
+type sociIndexSource struct {
+	desc        ocispec.Descriptor
+	refspec     reference.Spec
+	remoteStore *orasremote.Repository
+	hermes      bool
+	image       string
+}
+
+func (c *sociContext) Init(ctx context.Context, fs *filesystem, imageManifestDigest string, client *http.Client, source sociIndexSource) error {
 	c.fetchOnce.Do(func() {
-		index, err := fs.fetchSociIndex(ctx, imageRef, indexDigest, imageManifestDigest, client)
+		index, err := fs.fetchSociIndex(ctx, source)
 		if err != nil {
 			c.cachedErr = err
 			return
@@ -402,14 +411,52 @@ func (c *sociContext) findPrefetchArtifact(layerDigest string) *ocispec.Descript
 		return nil
 	}
 
-	for _, desc := range c.sociIndex.Blobs {
+	for i := range c.sociIndex.Blobs {
+		desc := &c.sociIndex.Blobs[i]
 		if desc.MediaType == soci.SociPrefetchMediaType {
 			if ociDigest, ok := desc.Annotations[soci.IndexAnnotationImageLayerDigest]; ok && ociDigest == layerDigest {
-				return &desc
+				return desc
 			}
 		}
 	}
 	return nil
+}
+
+func (c *sociContext) backgroundFetchPolicy() layer.BackgroundFetchPolicy {
+	if c.sociIndex == nil {
+		return layer.BackgroundFetchPolicy{Mode: layer.BackgroundFetchEnabled}
+	}
+	value := strings.ToLower(strings.TrimSpace(c.sociIndex.Annotations[soci.IndexAnnotationHermesBackgroundFetch]))
+	switch value {
+	case soci.IndexAnnotationHermesBackgroundFetchDisabled:
+		return layer.BackgroundFetchPolicy{Mode: layer.BackgroundFetchDisabled}
+	case soci.IndexAnnotationHermesBackgroundFetchEnabled:
+		return layer.BackgroundFetchPolicy{Mode: layer.BackgroundFetchEnabled}
+	default:
+		return layer.BackgroundFetchPolicy{Mode: layer.BackgroundFetchEnabled}
+	}
+}
+
+func (c *sociContext) skipFileVerification() bool {
+	if c.sociIndex == nil {
+		return false
+	}
+	value := strings.TrimSpace(c.sociIndex.Annotations[soci.IndexAnnotationHermesSkipFileVerification])
+	enabled, err := strconv.ParseBool(value)
+	return err == nil && enabled
+}
+
+func (c *sociContext) shouldPreResolveNeighboringLayers() bool {
+	policy := c.backgroundFetchPolicy()
+	return policy.Mode != layer.BackgroundFetchDisabled
+}
+
+func (c *sociContext) shouldPauseBackgroundFetchOnMount() bool {
+	if c.sociIndex == nil {
+		return true
+	}
+	value := strings.ToLower(strings.TrimSpace(c.sociIndex.Annotations[soci.IndexAnnotationHermesBackgroundFetch]))
+	return value != soci.IndexAnnotationHermesBackgroundFetchEnabled
 }
 
 type filesystem struct {
@@ -819,45 +866,99 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 }
 
 func (fs *filesystem) getSociContext(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (*sociContext, error) {
-	cAny, _ := fs.sociContexts.LoadOrStore(imageManifestDigest, &sociContext{})
-	c, ok := cAny.(*sociContext)
-	if !ok {
-		return nil, fmt.Errorf("could not load index: fs soci context is invalid type for %s", indexDigest)
+	source, err := fs.resolveSociIndexSource(ctx, imageRef, indexDigest, imageManifestDigest, client)
+	if err != nil {
+		return nil, err
 	}
-	err := c.Init(ctx, fs, imageRef, indexDigest, imageManifestDigest, client)
-	return c, err
+	c, err := fs.initSociContext(ctx, imageManifestDigest, client, source)
+	if err == nil {
+		return c, nil
+	}
+	if !source.hermes || !fs.externalArtifactStore.FallbackToRegistry {
+		return nil, err
+	}
+
+	hermesErr := err
+	hermesIndexDigest := source.desc.Digest.String()
+	fs.sociContexts.Delete(sociContextCacheKey(imageManifestDigest, hermesIndexDigest))
+	log.G(ctx).WithError(hermesErr).Warn("Hermes artifact store fetch failed; falling back to registry")
+	source, err = fs.resolveRegistrySociIndexSource(ctx, imageRef, indexDigest, imageManifestDigest, client)
+	if err != nil {
+		return nil, fmt.Errorf("%w: error trying Hermes artifact store: %v; registry fallback: %w", snapshot.ErrNoIndex, hermesErr, err)
+	}
+	c, err = fs.initSociContext(ctx, imageManifestDigest, client, source)
+	if err != nil {
+		return nil, fmt.Errorf("%w: error trying Hermes artifact store: %v; registry fallback: %w", snapshot.ErrNoIndex, hermesErr, err)
+	}
+	return c, nil
 }
 
-func (fs *filesystem) fetchSociIndex(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (*soci.Index, error) {
-	refspec, err := reference.Parse(imageRef)
-	if err != nil {
+func (fs *filesystem) initSociContext(ctx context.Context, imageManifestDigest string, client *http.Client, source sociIndexSource) (*sociContext, error) {
+	cacheKey := sociContextCacheKey(imageManifestDigest, source.desc.Digest.String())
+	cAny, _ := fs.sociContexts.LoadOrStore(cacheKey, &sociContext{})
+	c, ok := cAny.(*sociContext)
+	if !ok {
+		return nil, fmt.Errorf("could not load index: fs soci context is invalid type for %s", source.desc.Digest)
+	}
+	if err := c.Init(ctx, fs, imageManifestDigest, client, source); err != nil {
 		return nil, err
 	}
+	return c, nil
+}
 
-	remoteStore, err := newRemoteStore(refspec, client)
-	if err != nil {
-		return nil, err
-	}
+func sociContextCacheKey(imageManifestDigest, indexDigest string) string {
+	return imageManifestDigest + "|" + indexDigest
+}
 
+func (fs *filesystem) resolveSociIndexSource(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (sociIndexSource, error) {
 	if fs.externalArtifactStore.Enable {
-		index, err := FetchHermesArtifacts(ctx, fs.externalArtifactStore, imageRef, imageManifestDigest, fs.contentStore)
+		indexDesc, imageDigestRef, err := ResolveHermesIndex(ctx, nil, fs.externalArtifactStore, imageRef, imageManifestDigest)
 		if err == nil {
-			return index, nil
+			return sociIndexSource{
+				desc:   indexDesc,
+				hermes: true,
+				image:  imageDigestRef,
+			}, nil
 		}
 		if !fs.externalArtifactStore.FallbackToRegistry {
-			return nil, fmt.Errorf("%w: error trying Hermes artifact store: %w", snapshot.ErrNoIndex, err)
+			return sociIndexSource{}, fmt.Errorf("%w: error trying Hermes artifact store: %w", snapshot.ErrNoIndex, err)
 		}
 		log.G(ctx).WithError(err).Warn("Hermes artifact store miss; falling back to registry")
 	}
 
-	indexDesc, err := fs.findSociIndexDesc(ctx, imageManifestDigest, indexDigest, remoteStore)
+	return fs.resolveRegistrySociIndexSource(ctx, imageRef, indexDigest, imageManifestDigest, client)
+}
+
+func (fs *filesystem) resolveRegistrySociIndexSource(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (sociIndexSource, error) {
+	refspec, err := reference.Parse(imageRef)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", snapshot.ErrNoIndex, err)
+		return sociIndexSource{}, err
 	}
 
-	log.G(ctx).WithField("digest", indexDesc.Digest.String()).Infof("fetching SOCI artifacts using index descriptor")
+	remoteStore, err := newRemoteStore(refspec, client)
+	if err != nil {
+		return sociIndexSource{}, err
+	}
 
-	index, err := FetchSociArtifacts(ctx, refspec, indexDesc, fs.contentStore, remoteStore)
+	indexDesc, err := fs.findSociIndexDesc(ctx, imageManifestDigest, indexDigest, remoteStore)
+	if err != nil {
+		return sociIndexSource{}, fmt.Errorf("%w: %w", snapshot.ErrNoIndex, err)
+	}
+	return sociIndexSource{
+		desc:        indexDesc,
+		refspec:     refspec,
+		remoteStore: remoteStore,
+	}, nil
+}
+
+func (fs *filesystem) fetchSociIndex(ctx context.Context, source sociIndexSource) (*soci.Index, error) {
+	if source.hermes {
+		return FetchHermesArtifactsByDescriptor(ctx, nil, fs.externalArtifactStore, source.image, source.desc, fs.contentStore)
+	}
+
+	log.G(ctx).WithField("digest", source.desc.Digest.String()).Infof("fetching SOCI artifacts using index descriptor")
+
+	index, err := FetchSociArtifacts(ctx, source.refspec, source.desc, fs.contentStore, source.remoteStore)
 	if err != nil {
 		return nil, fmt.Errorf("%w: error trying to fetch SOCI artifacts: %w", snapshot.ErrNoIndex, err)
 	}
@@ -1061,7 +1162,8 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 
 			prefetchDesc := c.findPrefetchArtifact(s.Target.Digest.String())
 
-			l, err := fs.resolver.Resolve(ctx, s.Hosts, s.Name, s.Target, sociDesc, c.fuseOperationCounter, fs.disableVerification, prefetchDesc)
+			disableVerification := fs.disableVerification || c.skipFileVerification()
+			l, err := fs.resolver.Resolve(ctx, s.Hosts, s.Name, s.Target, sociDesc, c.fuseOperationCounter, disableVerification, prefetchDesc, c.backgroundFetchPolicy())
 			if err == nil {
 				resultChan <- l
 				return
@@ -1075,32 +1177,37 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 	if !ok {
 		return errors.New("could not find namespace attached to context")
 	}
-	// Also resolve and cache other layers in parallel
-	preResolve := src[0] // TODO: should we pre-resolve blobs in other sources as well?
-	for _, desc := range neighboringLayers(preResolve.Manifest, preResolve.Target) {
-		imgNameAndDigest := preResolve.Name.String() + "/" + desc.Digest.String()
-		fs.pr.Enqueue(imgNameAndDigest, func(ctx context.Context) string {
-			// Use context from the preresolver, but append namespace from current ctx
-			ctx = namespaces.WithNamespace(ctx, ns)
-			sociDesc, ok := c.imageLayerToSociDesc[desc.Digest.String()]
-			if !ok {
-				log.G(ctx).WithError(snapshot.ErrNoZtoc).WithField("layerDigest", desc.Digest.String()).Debug("skipping layer pre-resolve")
+	// Also resolve and cache other layers in parallel unless the mode favors
+	// a clean startup path.
+	if c.shouldPreResolveNeighboringLayers() {
+		preResolve := src[0] // TODO: should we pre-resolve blobs in other sources as well?
+		for _, desc := range neighboringLayers(preResolve.Manifest, preResolve.Target) {
+			desc := desc
+			imgNameAndDigest := preResolve.Name.String() + "/" + desc.Digest.String()
+			fs.pr.Enqueue(imgNameAndDigest, func(ctx context.Context) string {
+				// Use context from the preresolver, but append namespace from current ctx
+				ctx = namespaces.WithNamespace(ctx, ns)
+				sociDesc, ok := c.imageLayerToSociDesc[desc.Digest.String()]
+				if !ok {
+					log.G(ctx).WithError(snapshot.ErrNoZtoc).WithField("layerDigest", desc.Digest.String()).Debug("skipping layer pre-resolve")
+					return imgNameAndDigest
+				}
+
+				prefetchDesc := c.findPrefetchArtifact(desc.Digest.String())
+
+				disableVerification := fs.disableVerification || c.skipFileVerification()
+				l, err := fs.resolver.Resolve(ctx, preResolve.Hosts, preResolve.Name, desc, sociDesc, c.fuseOperationCounter, disableVerification, prefetchDesc, c.backgroundFetchPolicy())
+				if err != nil {
+					log.G(ctx).WithError(err).Debug("failed to pre-resolve")
+					return imgNameAndDigest
+				}
+				// Release this layer because this isn't target and we don't use it anymore here.
+				// However, this will remain on the resolver cache until eviction.
+				l.Done()
+
 				return imgNameAndDigest
-			}
-
-			prefetchDesc := c.findPrefetchArtifact(desc.Digest.String())
-
-			l, err := fs.resolver.Resolve(ctx, preResolve.Hosts, preResolve.Name, desc, sociDesc, c.fuseOperationCounter, fs.disableVerification, prefetchDesc)
-			if err != nil {
-				log.G(ctx).WithError(err).Debug("failed to pre-resolve")
-				return imgNameAndDigest
-			}
-			// Release this layer because this isn't target and we don't use it anymore here.
-			// However, this will remain on the resolver cache until eviction.
-			l.Done()
-
-			return imgNameAndDigest
-		})
+			})
+		}
 	}
 
 	// Wait for resolving completion
@@ -1185,7 +1292,7 @@ func (fs *filesystem) setupFuseServer(ctx context.Context, mountpoint string, no
 		// Send a signal to the background fetcher that a new image is being mounted
 		// and to pause all background fetches.
 		c.bgFetchPauseOnce.Do(func() {
-			if fs.bgFetcher != nil {
+			if fs.bgFetcher != nil && c.shouldPauseBackgroundFetchOnMount() {
 				fs.bgFetcher.Pause()
 			}
 		})

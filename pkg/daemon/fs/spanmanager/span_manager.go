@@ -52,6 +52,10 @@ type SpanManager struct {
 	ztoc                              *ztoc.Ztoc
 	maxSpanVerificationFailureRetries int
 	closeOnce                         sync.Once
+	hotMu                             sync.Mutex
+	hotMaxEntries                     int
+	hotSpans                          map[compression.SpanID][]byte
+	hotOrder                          []compression.SpanID
 }
 
 type spanInfo struct {
@@ -117,6 +121,29 @@ func New(ztoc *ztoc.Ztoc, r *io.SectionReader, cache cache.BlobCache, retries in
 	return m, nil
 }
 
+// EnableHotCache keeps a bounded set of uncompressed spans in memory.
+// It is intended for startup profiles that synchronously pre-resolve a small
+// hot set and then immediately serve many small reads from those same spans.
+func (m *SpanManager) EnableHotCache(maxEntries int) {
+	m.hotMu.Lock()
+	defer m.hotMu.Unlock()
+	if maxEntries <= 0 {
+		m.hotMaxEntries = 0
+		m.hotSpans = nil
+		m.hotOrder = nil
+		return
+	}
+	m.hotMaxEntries = maxEntries
+	if m.hotSpans == nil {
+		m.hotSpans = make(map[compression.SpanID][]byte, maxEntries)
+	}
+	for len(m.hotOrder) > maxEntries {
+		victim := m.hotOrder[0]
+		m.hotOrder = m.hotOrder[1:]
+		delete(m.hotSpans, victim)
+	}
+}
+
 func (m *SpanManager) buildAllSpans() {
 	var i compression.SpanID
 	for i = 0; i <= m.ztoc.MaxSpanID; i++ {
@@ -178,12 +205,43 @@ func (m *SpanManager) ResolveSpan(spanID compression.SpanID) error {
 		return nil
 	}
 
+	if s.checkState(fetched) {
+		_, err := m.uncompressCachedSpan(s)
+		return err
+	}
+
 	_, err := m.fetchAndCacheSpan(spanID, true) // true = uncompress
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (m *SpanManager) ResolveSpanRange(startUncompOffset, endUncompOffset compression.Offset, maxSpans int) error {
+	if startUncompOffset < 0 {
+		startUncompOffset = 0
+	}
+	if endUncompOffset > m.ztoc.UncompressedArchiveSize {
+		endUncompOffset = m.ztoc.UncompressedArchiveSize
+	}
+	if endUncompOffset <= startUncompOffset {
+		return nil
+	}
+	si := m.getSpanInfo(startUncompOffset, endUncompOffset-1)
+	total := int(si.spanEnd-si.spanStart) + 1
+	if maxSpans <= 0 || maxSpans > total {
+		maxSpans = total
+	}
+
+	var retErr error
+	for i := 0; i < maxSpans; i++ {
+		spanID := si.spanStart + compression.SpanID(i)
+		if err := m.ResolveSpan(spanID); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("resolve span %d: %w", spanID, err))
+		}
+	}
+	return retErr
 }
 
 // resolveSpan ensures the span exists in cache and is uncompressed by calling
@@ -278,6 +336,9 @@ func (m *SpanManager) getSpanContent(spanID compression.SpanID, offsetStart, off
 
 	// return from cache directly if cached and uncompressed
 	if s.checkState(uncompressed) {
+		if buf, ok := m.getHotSpan(spanID); ok {
+			return io.NopCloser(bytes.NewReader(buf[offsetStart : offsetStart+size])), nil
+		}
 		return m.getSpanFromCache(s.id, offsetStart, size)
 	}
 
@@ -285,36 +346,16 @@ func (m *SpanManager) getSpanContent(spanID compression.SpanID, offsetStart, off
 	defer s.mu.Unlock()
 	// check again after acquiring lock
 	if s.checkState(uncompressed) {
+		if buf, ok := m.getHotSpan(spanID); ok {
+			return io.NopCloser(bytes.NewReader(buf[offsetStart : offsetStart+size])), nil
+		}
 		return m.getSpanFromCache(s.id, offsetStart, size)
 	}
 
 	// if cached but not uncompressed, uncompress and cache the span content
 	if s.checkState(fetched) {
-		// get compressed span from the cache
-		compressedSize := s.endCompOffset - s.startCompOffset
-		r, err := m.getSpanFromCache(s.id, 0, compressedSize)
+		uncompSpanBuf, err := m.uncompressCachedSpan(s)
 		if err != nil {
-			return nil, err
-		}
-		defer r.Close()
-
-		// read compressed span
-		compressedBuf, err := io.ReadAll(r)
-		if err != nil {
-			return nil, err
-		}
-
-		// uncompress span
-		uncompSpanBuf, err := m.uncompressSpan(s, compressedBuf)
-		if err != nil {
-			return nil, err
-		}
-
-		// cache uncompressed span
-		if err := m.addSpanToCache(s.id, uncompSpanBuf); err != nil {
-			return nil, err
-		}
-		if err := s.setState(uncompressed); err != nil {
 			return nil, err
 		}
 		return io.NopCloser(bytes.NewReader(uncompSpanBuf[offsetStart : offsetStart+size])), nil
@@ -328,6 +369,34 @@ func (m *SpanManager) getSpanContent(spanID compression.SpanID, offsetStart, off
 	}
 	buf := bytes.NewBuffer(uncompBuf[offsetStart : offsetStart+size])
 	return io.NopCloser(buf), nil
+}
+
+func (m *SpanManager) uncompressCachedSpan(s *span) ([]byte, error) {
+	compressedSize := s.endCompOffset - s.startCompOffset
+	r, err := m.getSpanFromCache(s.id, 0, compressedSize)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	compressedBuf, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+
+	uncompSpanBuf, err := m.uncompressSpan(s, compressedBuf)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := m.addSpanToCache(s.id, uncompSpanBuf); err != nil {
+		return nil, err
+	}
+	m.addHotSpan(s.id, uncompSpanBuf)
+	if err := s.setState(uncompressed); err != nil {
+		return nil, err
+	}
+	return uncompSpanBuf, nil
 }
 
 // fetchAndCacheSpan fetches a span, uncompresses the span if `uncompress == true`,
@@ -372,10 +441,45 @@ func (m *SpanManager) fetchAndCacheSpan(spanID compression.SpanID, uncompress bo
 	if err := m.addSpanToCache(spanID, buf); err != nil {
 		return nil, err
 	}
+	if uncompress {
+		m.addHotSpan(spanID, buf)
+	}
 	if err := s.setState(state); err != nil {
 		return nil, err
 	}
 	return buf, nil
+}
+
+func (m *SpanManager) getHotSpan(spanID compression.SpanID) ([]byte, bool) {
+	m.hotMu.Lock()
+	defer m.hotMu.Unlock()
+	if m.hotMaxEntries <= 0 || m.hotSpans == nil {
+		return nil, false
+	}
+	buf, ok := m.hotSpans[spanID]
+	return buf, ok
+}
+
+func (m *SpanManager) addHotSpan(spanID compression.SpanID, buf []byte) {
+	m.hotMu.Lock()
+	defer m.hotMu.Unlock()
+	if m.hotMaxEntries <= 0 {
+		return
+	}
+	if m.hotSpans == nil {
+		m.hotSpans = make(map[compression.SpanID][]byte, m.hotMaxEntries)
+	}
+	if _, ok := m.hotSpans[spanID]; ok {
+		m.hotSpans[spanID] = buf
+		return
+	}
+	m.hotSpans[spanID] = buf
+	m.hotOrder = append(m.hotOrder, spanID)
+	for len(m.hotOrder) > m.hotMaxEntries {
+		victim := m.hotOrder[0]
+		m.hotOrder = m.hotOrder[1:]
+		delete(m.hotSpans, victim)
+	}
 }
 
 // fetchSpanWithRetries fetches the requested data and verifies that the span digest matches the one in the ztoc.
