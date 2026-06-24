@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Go modules — proactively keep dependencies fresh so fewer published CVEs
+  # land on stale versions. Bundled into a single weekly PR to reduce noise.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    groups:
+      go-dependencies:
+        applies-to: version-updates
+        patterns:
+          - "*"
+
+  # GitHub Actions used in workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
