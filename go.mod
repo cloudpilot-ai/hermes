@@ -3,7 +3,7 @@ module github.com/cloudpilot-ai/hermes
 go 1.25.0
 
 require (
-	github.com/containerd/containerd v1.7.32
+	github.com/containerd/containerd v1.7.33
 	github.com/containerd/containerd/api v1.8.0
 	github.com/containerd/continuity v0.5.0
 	github.com/containerd/errdefs v1.0.0
