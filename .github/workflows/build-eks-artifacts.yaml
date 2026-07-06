@@ -16,13 +16,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name || github.ref }}
           fetch-depth: 0
           submodules: true
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.25.9"
           cache: false
@@ -52,7 +52,7 @@ jobs:
         run: |
           aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/cloudpilotai
 
-      - uses: ko-build/setup-ko@v0.6
+      - uses: ko-build/setup-ko@v0.9
 
       - name: Build and publish controller image
         run: |
@@ -72,20 +72,20 @@ jobs:
           sha256sum hermes-daemon-linux-amd64.tar.gz | awk '{print $1}' > hermes-daemon-linux-amd64.tar.gz.sha256
 
       - name: Upload daemon tarball
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hermes-daemon-linux-amd64-tar-gz
           path: hermes-daemon-linux-amd64.tar.gz
 
       - name: Upload daemon checksum
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hermes-daemon-linux-amd64-tar-gz-sha256
           path: hermes-daemon-linux-amd64.tar.gz.sha256
 
       - name: Upload daemon assets to GitHub Release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.release.tag_name }}
           generate_release_notes: true
