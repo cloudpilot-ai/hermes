@@ -3,7 +3,7 @@ module github.com/cloudpilot-ai/hermes
 go 1.26.0
 
 require (
-	github.com/containerd/containerd v1.7.33
+	github.com/containerd/containerd v1.7.34
 	github.com/containerd/containerd/api v1.11.1
 	github.com/containerd/continuity v0.5.0
 	github.com/containerd/errdefs v1.0.0
@@ -21,7 +21,7 @@ require (
 	github.com/moby/sys/mountinfo v0.7.2
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
-	github.com/opencontainers/runtime-spec v1.2.1
+	github.com/opencontainers/runtime-spec v1.3.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/xid v1.6.0
@@ -31,13 +31,13 @@ require (
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/time v0.15.0
-	google.golang.org/grpc v1.82.0
+	google.golang.org/grpc v1.82.1
 	k8s.io/api v0.36.2
 	k8s.io/apimachinery v0.36.2
 	k8s.io/client-go v0.36.2
 	k8s.io/cri-api v0.36.2
 	modernc.org/sqlite v1.53.0
-	oras.land/oras-go/v2 v2.6.2-0.20260703153412-c463c654ab3e
+	oras.land/oras-go/v2 v2.6.2
 )
 
 require (
