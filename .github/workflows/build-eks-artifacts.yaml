@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+# Architecture tags are rolling inputs to the final multi-platform index.
+concurrency:
+  group: hermes-container-publish
+  cancel-in-progress: false
+
 jobs:
   controller-images:
     name: Build controller (${{ matrix.arch }})
@@ -23,6 +28,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
+      - name: Validate Alibaba Cloud mirror configuration
+        env:
+          ALIYUN_REGISTRY: ${{ vars.ALIYUN_REGISTRY }}
+          ACR_USERNAME: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+        run: |
+          test -n "$ALIYUN_REGISTRY" || { echo 'Configure ALIYUN_REGISTRY before publishing'; exit 1; }
+          [[ "$ALIYUN_REGISTRY" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*(:[0-9]+)?$ ]] || { echo 'ALIYUN_REGISTRY must be a registry hostname'; exit 1; }
+          test -n "$ACR_USERNAME" || { echo 'Configure ALIYUN_REGISTRY_USERNAME before publishing'; exit 1; }
+          test -n "$ACR_PASSWORD" || { echo 'Configure ALIYUN_REGISTRY_PASSWORD before publishing'; exit 1; }
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name || github.ref }}
@@ -83,18 +99,78 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Publish multi-platform index
+        id: build
         env:
           IMAGE: public.ecr.aws/cloudpilotai/hermes-controller
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          ALIYUN_REGISTRY: ${{ vars.ALIYUN_REGISTRY }}
         run: |
           tags=(--tag "${IMAGE}:latest")
           if [[ -n "${RELEASE_TAG}" ]]; then
             tags+=(--tag "${IMAGE}:${RELEASE_TAG}")
           fi
-          docker buildx imagetools create "${tags[@]}" "${IMAGE}:latest-amd64" "${IMAGE}:latest-arm64"
+          docker buildx imagetools create --metadata-file "$RUNNER_TEMP/index-metadata.json" \
+            "${tags[@]}" "${IMAGE}:latest-amd64" "${IMAGE}:latest-arm64"
+          mkdir -p mirror-requests
+          python3 - <<'REQUEST'
+          import hashlib, json, os, re
+          from pathlib import Path
+          metadata = json.loads((Path(os.environ['RUNNER_TEMP']) / 'index-metadata.json').read_text())
+          digest = metadata['containerimage.descriptor']['digest']
+          if not re.fullmatch(r'sha256:[a-f0-9]{64}', digest):
+              raise SystemExit('Index publication did not return a complete SHA256 digest')
+          source = os.environ['IMAGE'] + '@' + digest
+          tag = os.environ['RELEASE_TAG']
+          immutable, mutable = [], ['latest']
+          # A published release tag is immutable; latest remains the rolling alias.
+          if tag and tag != 'latest':
+              immutable.append(tag)
+          request = dict(schemaVersion=1, sourceRef=source,
+                         targetRepository=os.environ['ALIYUN_REGISTRY'] + '/cloudpilotai/hermes-controller',
+                         immutableTags=immutable, mutableTags=mutable)
+          path = Path('mirror-requests/hermes-controller.json')
+          path.write_text(json.dumps(request, indent=2) + '\n')
+          path.with_suffix('.sha256').write_text(hashlib.sha256(path.read_bytes()).hexdigest() + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in dict(source_ref=source, immutable_tags=json.dumps(immutable), mutable_tags=json.dumps(mutable)).items():
+                  output.write(f'{key}={value}\n')
+          REQUEST
+
+      # Release source refs may predate the delivery tool; load it from this workflow revision.
+      - name: Check out the reviewed mirror tool
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .mirror-tools
+          sparse-checkout: .github/actions/mirror-container-image
+          persist-credentials: false
+
+      - name: Mirror controller index to Alibaba Cloud
+        uses: ./.mirror-tools/.github/actions/mirror-container-image
+        with:
+          source-ref: ${{ steps.build.outputs.source_ref }}
+          target-repository: ${{ vars.ALIYUN_REGISTRY }}/cloudpilotai/hermes-controller
+          immutable-tags-json: ${{ steps.build.outputs.immutable_tags }}
+          mutable-tags-json: ${{ steps.build.outputs.mutable_tags }}
+        env:
+          ACR_USERNAME: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      - name: Preserve mirror requests and verification receipts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hermes-controller-mirror-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          path: |
+            mirror-requests/
+            ${{ runner.temp }}/mirror-container-image/**/request.json
+            ${{ runner.temp }}/mirror-container-image/**/request.sha256
+            ${{ runner.temp }}/mirror-container-image/**/receipt.json
 
   daemon-artifacts:
     name: Build Hermes daemon artifacts
+    needs: controller-index
     runs-on: ubuntu-latest
 
     steps:
