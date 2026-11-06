@@ -1,53 +1,56 @@
 name: PR Build
-
-on:
+'on':
   pull_request:
-    branches: ["main"]
+    branches:
+    - main
+    - ci-cache-trial/go-cache-20261106
   workflow_dispatch: {}
   push:
-    branches: [ "main" ]
-
+    branches:
+    - main
+    - ci-cache-trial/go-cache-20261106
 permissions:
   contents: read
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   build:
     name: Build and test
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v7
+    - uses: actions/checkout@v7
+    - name: Restore Go CI cache
+      id: setup-go
+      uses: cloudx-io/setup-go@0bbd76c0381c065220668df9b6694845b937aaa0
+      with:
+        go-version: 1.26.0
+        cache-key-prefix: ${{ github.job }}
+        cache-dependency-path: '**/go.*'
+        save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci-cache-trial/go-cache-20261106') }}
+    - name: Install build dependencies
+      run: 'sudo apt-get update
 
-      - name: Restore Go CI cache
-        id: setup-go
-        uses: cloudx-io/setup-go@0bbd76c0381c065220668df9b6694845b937aaa0 # main: restore-only support
-        with:
-          go-version: "1.26.0"
-          cache-key-prefix: ${{ github.job }}
-          cache-dependency-path: '**/go.*'
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev
+        '
+    - name: Test
+      run: go test ./...
+    - name: Build controller
+      run: 'mkdir -p bin
 
-      - name: Test
-        run: go test ./...
+        CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/hermes-controller ./cmd/controller
 
-      - name: Build controller
-        run: |
-          mkdir -p bin
-          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/hermes-controller ./cmd/controller
+        '
+    - name: Build daemon
+      run: 'mkdir -p bin
 
-      - name: Build daemon
-        run: |
-          mkdir -p bin
-          GIT_VERSION="$(git describe --tags --always --dirty)"
-          GIT_COMMIT="$(git rev-parse HEAD)"
-          ldflags="-s -w -linkmode external -extldflags '-static' -X github.com/cloudpilot-ai/hermes/pkg/common/version.Version=${GIT_VERSION} -X github.com/cloudpilot-ai/hermes/pkg/common/version.Revision=${GIT_COMMIT}"
-          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -tags "netgo osusergo" -ldflags "${ldflags}" -o bin/hermes-daemon ./cmd/daemon
+        GIT_VERSION="$(git describe --tags --always --dirty)"
+
+        GIT_COMMIT="$(git rev-parse HEAD)"
+
+        ldflags="-s -w -linkmode external -extldflags ''-static'' -X github.com/cloudpilot-ai/hermes/pkg/common/version.Version=${GIT_VERSION} -X github.com/cloudpilot-ai/hermes/pkg/common/version.Revision=${GIT_COMMIT}"
+
+        CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -tags "netgo osusergo" -ldflags "${ldflags}" -o bin/hermes-daemon ./cmd/daemon
+
+        '
