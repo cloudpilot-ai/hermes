@@ -28,6 +28,25 @@ jobs:
         cache-key-prefix: ${{ github.job }}
         cache-dependency-path: '**/go.*'
         save: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci-cache-trial/go-cache-20261106') }}
+    - name: Locate trial Go cache paths
+      id: trial-cache-paths
+      shell: bash
+      run: 'printf ''gocache=%s\n'' "$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+
+        printf ''gomodcache=%s\n'' "$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+
+        '
+    - name: Restore warmed trial Go cache
+      id: trial-go-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: '${{ steps.trial-cache-paths.outputs.gocache }}
+
+          ${{ steps.trial-cache-paths.outputs.gomodcache }}
+
+          '
+        key: go-cache-Linux-X64-build-1.26.0-ci-cache-trial/go-cache-20261106-e6dc09d08c51822b45395e94c85f1b2734b523e5d0d54592b4628c2ee605a785-42248770432
+        fail-on-cache-miss: true
     - name: Install build dependencies
       run: 'sudo apt-get update
 
