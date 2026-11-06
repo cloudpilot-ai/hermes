@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: ["main"]
   workflow_dispatch: {}
+  push:
+    branches: [ "main" ]
 
 permissions:
   contents: read
@@ -20,9 +22,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - name: Restore Go CI cache
+        id: setup-go
+        uses: cloudx-io/setup-go@0bbd76c0381c065220668df9b6694845b937aaa0 # main: restore-only support
         with:
           go-version: "1.26.0"
+          cache-key-prefix: ${{ github.job }}
+          cache-dependency-path: '**/go.*'
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install build dependencies
         run: |
